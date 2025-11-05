@@ -137,13 +137,42 @@ class _HomePageState extends State<HomePage>
   bool _isUserScrolling = false;
   Timer? _userScrollTimer;
 
-  bool get _supportsBackgroundExecution {
+  bool get _isHarmonyDevice {
     try {
-      return Platform.isAndroid;
+      final os = Platform.operatingSystem.toLowerCase();
+      if (os.contains('harmony') ||
+          os.contains('openharmony') ||
+          os.contains('ohos')) {
+        return true;
+      }
+    } catch (_) {}
+    try {
+      final version = Platform.operatingSystemVersion.toLowerCase();
+      if (version.contains('harmony') ||
+          version.contains('openharmony') ||
+          version.contains('ohos')) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  bool get _isAndroidOrHarmony {
+    try {
+      if (Platform.isAndroid) return true;
+    } catch (_) {}
+    return _isHarmonyDevice;
+  }
+
+  bool get _isIOSPlatform {
+    try {
+      return Platform.isIOS;
     } catch (_) {
       return false;
     }
   }
+
+  bool get _supportsBackgroundExecution => _isAndroidOrHarmony;
 
   bool _backgroundInitialized = false;
   bool _backgroundExecutionEnabled = false;
@@ -5554,7 +5583,7 @@ class _HomePageState extends State<HomePage>
                                 _sendMessage(text);
                                 _inputController.clear();
                                 // Keep focus on desktop; only dismiss on mobile to hide soft keyboard
-                                if (Platform.isAndroid || Platform.isIOS) {
+                                if (_isAndroidOrHarmony || _isIOSPlatform) {
                                   _dismissKeyboard();
                                 } else {
                                   _inputFocus.requestFocus();
@@ -7561,8 +7590,8 @@ class _HomePageState extends State<HomePage>
                                             onSend: (text) {
                                               _sendMessage(text);
                                               _inputController.clear();
-                                              if (Platform.isAndroid ||
-                                                  Platform.isIOS) {
+                                              if (_isAndroidOrHarmony ||
+                                                  _isIOSPlatform) {
                                                 _dismissKeyboard();
                                               } else {
                                                 _inputFocus.requestFocus();
