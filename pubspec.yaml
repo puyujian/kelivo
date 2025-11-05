@@ -83,6 +83,7 @@ dependencies:
   system_fonts: ^1.0.1
   google_fonts: ^6.3.2
   super_clipboard: ^0.9.1
+  flutter_background: ^1.3.0
   flutter_tts:
     path: ./dependencies/flutter_tts
 

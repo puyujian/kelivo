@@ -52,7 +52,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import '../../../utils/brand_assets.dart';
 import 'package:flutter/rendering.dart';
-import 'package:flutter/foundation.dart' show defaultTargetPlatform, TargetPlatform;
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'dart:ui' as ui;
 import 'package:image_picker/image_picker.dart';
 import 'package:file_picker/file_picker.dart';
@@ -74,7 +75,7 @@ import '../../quick_phrase/pages/quick_phrases_page.dart';
 import '../../../shared/widgets/ios_checkbox.dart';
 import '../../../desktop/quick_phrase_popover.dart';
 import '../../../utils/app_directories.dart';
-
+import 'package:flutter_background/flutter_background.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -83,7 +84,8 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin, RouteAware {
+class _HomePageState extends State<HomePage>
+    with SingleTickerProviderStateMixin, RouteAware, WidgetsBindingObserver {
   bool get _isDesktopPlatform =>
       defaultTargetPlatform == TargetPlatform.macOS ||
       defaultTargetPlatform == TargetPlatform.windows ||
@@ -95,7 +97,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   static const Duration _scrollAnimateDuration = Duration(milliseconds: 300);
   static const Duration _postSwitchScrollDelay = Duration(milliseconds: 220);
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
-  final InteractiveDrawerController _drawerController = InteractiveDrawerController();
+  final InteractiveDrawerController _drawerController =
+      InteractiveDrawerController();
   final ValueNotifier<int> _assistantPickerCloseTick = ValueNotifier<int>(0);
   final FocusNode _inputFocus = FocusNode();
   final TextEditingController _inputController = TextEditingController();
@@ -110,23 +113,110 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   Conversation? _currentConversation;
   List<ChatMessage> _messages = [];
   // Support concurrent generation per conversation
-  final Map<String, StreamSubscription> _conversationStreams = <String, StreamSubscription>{}; // conversationId -> subscription
-  final Set<String> _loadingConversationIds = <String>{}; // active generating conversations
+  final Map<String, StreamSubscription> _conversationStreams =
+      <String, StreamSubscription>{}; // conversationId -> subscription
+  final Set<String> _loadingConversationIds =
+      <String>{}; // active generating conversations
   final Map<String, _ReasoningData> _reasoning = <String, _ReasoningData>{};
-  final Map<String, _TranslationData> _translations = <String, _TranslationData>{};
-  final Map<String, List<ToolUIPart>> _toolParts = <String, List<ToolUIPart>>{}; // assistantMessageId -> parts
-  final Map<String, List<_ReasoningSegmentData>> _reasoningSegments = <String, List<_ReasoningSegmentData>>{}; // assistantMessageId -> reasoning segments
+  final Map<String, _TranslationData> _translations =
+      <String, _TranslationData>{};
+  final Map<String, List<ToolUIPart>> _toolParts =
+      <String, List<ToolUIPart>>{}; // assistantMessageId -> parts
+  final Map<String, List<_ReasoningSegmentData>> _reasoningSegments =
+      <
+        String,
+        List<_ReasoningSegmentData>
+      >{}; // assistantMessageId -> reasoning segments
   // Message widget keys for navigation to previous question
   final Map<String, GlobalKey> _messageKeys = <String, GlobalKey>{};
-  GlobalKey _keyForMessage(String id) => _messageKeys.putIfAbsent(id, () => GlobalKey(debugLabel: 'msg:$id'));
+  GlobalKey _keyForMessage(String id) =>
+      _messageKeys.putIfAbsent(id, () => GlobalKey(debugLabel: 'msg:$id'));
   McpProvider? _mcpProvider;
   Set<String> _connectedMcpIds = <String>{};
   bool _showJumpToBottom = false;
   bool _isUserScrolling = false;
   Timer? _userScrollTimer;
 
+  bool get _supportsBackgroundExecution {
+    try {
+      return Platform.isAndroid;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool _backgroundInitialized = false;
+  bool _backgroundExecutionEnabled = false;
+  bool _backgroundUnavailable = false;
+
+  FlutterBackgroundAndroidConfig get _androidBackgroundConfig =>
+      const FlutterBackgroundAndroidConfig(
+        notificationTitle: 'Kelivo',
+        notificationText: 'Generating reply in background…',
+        notificationImportance: AndroidNotificationImportance.normal,
+        enableWifiLock: true,
+      );
+
+  Future<bool> _ensureBackgroundInitialized() async {
+    if (!_supportsBackgroundExecution || _backgroundUnavailable) return false;
+    if (_backgroundInitialized) return !_backgroundUnavailable;
+    try {
+      final success = await FlutterBackground.initialize(
+        androidConfig: _androidBackgroundConfig,
+      );
+      _backgroundInitialized = true;
+      if (!success) {
+        _backgroundUnavailable = true;
+      }
+      return success;
+    } catch (_) {
+      _backgroundInitialized = true;
+      _backgroundUnavailable = true;
+      return false;
+    }
+  }
+
+  Future<void> _ensureBackgroundExecution() async {
+    if (!_supportsBackgroundExecution ||
+        _backgroundExecutionEnabled ||
+        _backgroundUnavailable)
+      return;
+    final ready = await _ensureBackgroundInitialized();
+    if (!ready) return;
+    try {
+      final enabled = await FlutterBackground.enableBackgroundExecution();
+      _backgroundExecutionEnabled = enabled == true;
+      if (!_backgroundExecutionEnabled) {
+        _backgroundUnavailable = true;
+      }
+    } catch (_) {
+      _backgroundUnavailable = true;
+      _backgroundExecutionEnabled = false;
+    }
+  }
+
+  Future<void> _disableBackgroundExecution() async {
+    if (!_supportsBackgroundExecution || !_backgroundExecutionEnabled) return;
+    try {
+      await FlutterBackground.disableBackgroundExecution();
+    } catch (_) {}
+    _backgroundExecutionEnabled = false;
+  }
+
+  void _updateBackgroundExecutionState(bool loading) {
+    if (!_supportsBackgroundExecution) return;
+    if (loading) {
+      unawaited(_ensureBackgroundExecution());
+    } else if (_loadingConversationIds.isEmpty) {
+      unawaited(_disableBackgroundExecution());
+    }
+  }
+
   // Sanitize/translate JSON Schema to each provider's accepted subset
-  static Map<String, dynamic> _sanitizeToolParametersForProvider(Map<String, dynamic> schema, ProviderKind kind) {
+  static Map<String, dynamic> _sanitizeToolParametersForProvider(
+    Map<String, dynamic> schema,
+    ProviderKind kind,
+  ) {
     Map<String, dynamic> clone = _deepCloneMap(schema);
     clone = _sanitizeNode(clone, kind) as Map<String, dynamic>;
     return clone;
@@ -147,7 +237,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       }
       m.remove('const');
     }
-    for (final key in ['anyOf', 'oneOf', 'allOf', 'any_of', 'one_of', 'all_of']) {
+    for (final key in [
+      'anyOf',
+      'oneOf',
+      'allOf',
+      'any_of',
+      'one_of',
+      'all_of',
+    ]) {
       if (m[key] is List && (m[key] as List).isNotEmpty) {
         final first = (m[key] as List).first;
         final flattened = _sanitizeNode(first, kind);
@@ -177,11 +274,25 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     Set<String> allowed;
     switch (kind) {
       case ProviderKind.google:
-        allowed = {'type', 'description', 'properties', 'required', 'items', 'enum'};
+        allowed = {
+          'type',
+          'description',
+          'properties',
+          'required',
+          'items',
+          'enum',
+        };
         break;
       case ProviderKind.openai:
       case ProviderKind.claude:
-        allowed = {'type', 'description', 'properties', 'required', 'items', 'enum'};
+        allowed = {
+          'type',
+          'description',
+          'properties',
+          'required',
+          'items',
+          'enum',
+        };
         break;
     }
     m.removeWhere((k, v) => !allowed.contains(k));
@@ -191,6 +302,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   static Map<String, dynamic> _deepCloneMap(Map<String, dynamic> input) {
     return jsonDecode(jsonEncode(input)) as Map<String, dynamic>;
   }
+
   // Tablet: whether the left embedded sidebar is visible
   bool _tabletSidebarOpen = true;
   bool _learningModeEnabled = false;
@@ -201,7 +313,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   static const double _sidebarMinWidth = 200;
   static const double _sidebarMaxWidth = 480;
   bool _desktopUiInited = false;
-  
+
   void _openSearchSettings() {
     // On desktop platforms show the floating popover; mobile keeps bottom sheet
     try {
@@ -219,7 +331,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   Future<void> _openReasoningSettings() async {
     try {
       if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
-        await showDesktopReasoningBudgetPopover(context, anchorKey: _inputBarKey);
+        await showDesktopReasoningBudgetPopover(
+          context,
+          anchorKey: _inputBarKey,
+        );
       } else {
         await showReasoningBudgetSheet(context);
       }
@@ -241,7 +356,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     Widget? bg;
     if (bgRaw.isNotEmpty) {
       if (bgRaw.startsWith('http')) {
-        bg = Image.network(bgRaw, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const SizedBox.shrink());
+        bg = Image.network(
+          bgRaw,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+        );
       } else {
         try {
           final fixed = SandboxPathResolver.fix(bgRaw);
@@ -286,7 +405,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       context: context,
       isScrollControlled: true,
       backgroundColor: cs.surface,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
       builder: (ctx) {
         return SafeArea(
           top: false,
@@ -305,11 +426,20 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                   child: Container(
                     width: 40,
                     height: 4,
-                    decoration: BoxDecoration(color: cs.onSurface.withOpacity(0.2), borderRadius: BorderRadius.circular(999)),
+                    decoration: BoxDecoration(
+                      color: cs.onSurface.withOpacity(0.2),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 12),
-                Text(l10n.bottomToolsSheetPrompt, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                Text(
+                  l10n.bottomToolsSheetPrompt,
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
                 const SizedBox(height: 8),
                 TextField(
                   controller: controller,
@@ -317,10 +447,27 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                   decoration: InputDecoration(
                     hintText: l10n.bottomToolsSheetPromptHint,
                     filled: true,
-                    fillColor: Theme.of(ctx).brightness == Brightness.dark ? Colors.white10 : const Color(0xFFF2F3F5),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: cs.outlineVariant.withOpacity(0.4))),
-                    enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: cs.outlineVariant.withOpacity(0.4))),
-                    focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: cs.primary.withOpacity(0.5))),
+                    fillColor: Theme.of(ctx).brightness == Brightness.dark
+                        ? Colors.white10
+                        : const Color(0xFFF2F3F5),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(
+                        color: cs.outlineVariant.withOpacity(0.4),
+                      ),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(
+                        color: cs.outlineVariant.withOpacity(0.4),
+                      ),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(
+                        color: cs.primary.withOpacity(0.5),
+                      ),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 8),
@@ -336,7 +483,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                     const Spacer(),
                     FilledButton(
                       onPressed: () async {
-                        await LearningModeStore.setPrompt(controller.text.trim());
+                        await LearningModeStore.setPrompt(
+                          controller.text.trim(),
+                        );
                         if (ctx.mounted) Navigator.of(ctx).pop();
                       },
                       child: Text(l10n.bottomToolsSheetSave),
@@ -360,21 +509,29 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     final out = <ToolUIPart>[];
     for (final p in parts) {
       final id = (p.id).trim();
-      final key = id.isNotEmpty ? 'id:$id' : 'name:${p.toolName}|args:${jsonEncode(p.arguments)}';
+      final key = id.isNotEmpty
+          ? 'id:$id'
+          : 'name:${p.toolName}|args:${jsonEncode(p.arguments)}';
       if (seen.add(key)) out.add(p);
     }
     return out;
   }
 
   // Deduplicate raw persisted tool events using same criteria
-  List<Map<String, dynamic>> _dedupeToolEvents(List<Map<String, dynamic>> events) {
+  List<Map<String, dynamic>> _dedupeToolEvents(
+    List<Map<String, dynamic>> events,
+  ) {
     final seen = <String>{};
     final out = <Map<String, dynamic>>[];
     for (final e in events) {
       final id = (e['id']?.toString() ?? '').trim();
       final name = (e['name']?.toString() ?? '');
-      final args = ((e['arguments'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{});
-      final key = id.isNotEmpty ? 'id:$id' : 'name:$name|args:${jsonEncode(args)}';
+      final args =
+          ((e['arguments'] as Map?)?.cast<String, dynamic>() ??
+          const <String, dynamic>{});
+      final key = id.isNotEmpty
+          ? 'id:$id'
+          : 'name:$name|args:${jsonEncode(args)}';
       if (seen.add(key)) out.add(e.map((k, v) => MapEntry(k.toString(), v)));
     }
     return out;
@@ -382,17 +539,22 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   // Selection mode state for export/share
   bool _selecting = false;
-  final Set<String> _selectedItems = <String>{}; // selected message ids (collapsed view)
+  final Set<String> _selectedItems =
+      <String>{}; // selected message ids (collapsed view)
 
   // Helper methods to serialize/deserialize reasoning segments
   String _serializeReasoningSegments(List<_ReasoningSegmentData> segments) {
-    final list = segments.map((s) => {
-      'text': s.text,
-      'startAt': s.startAt?.toIso8601String(),
-      'finishedAt': s.finishedAt?.toIso8601String(),
-      'expanded': s.expanded,
-      'toolStartIndex': s.toolStartIndex,
-    }).toList();
+    final list = segments
+        .map(
+          (s) => {
+            'text': s.text,
+            'startAt': s.startAt?.toIso8601String(),
+            'finishedAt': s.finishedAt?.toIso8601String(),
+            'expanded': s.expanded,
+            'toolStartIndex': s.toolStartIndex,
+          },
+        )
+        .toList();
     return jsonEncode(list);
   }
 
@@ -403,8 +565,12 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       return list.map((item) {
         final s = _ReasoningSegmentData();
         s.text = item['text'] ?? '';
-        s.startAt = item['startAt'] != null ? DateTime.parse(item['startAt']) : null;
-        s.finishedAt = item['finishedAt'] != null ? DateTime.parse(item['finishedAt']) : null;
+        s.startAt = item['startAt'] != null
+            ? DateTime.parse(item['startAt'])
+            : null;
+        s.finishedAt = item['finishedAt'] != null
+            ? DateTime.parse(item['finishedAt'])
+            : null;
         s.expanded = item['expanded'] ?? false;
         s.toolStartIndex = (item['toolStartIndex'] as int?) ?? 0;
         return s;
@@ -419,10 +585,15 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     final cfg = settings.getProviderConfig(providerKey);
     final ov = cfg.modelOverrides[modelId] as Map?;
     if (ov != null) {
-      final abilities = (ov['abilities'] as List?)?.map((e) => e.toString()).toList() ?? const [];
-      if (abilities.map((e) => e.toLowerCase()).contains('reasoning')) return true;
+      final abilities =
+          (ov['abilities'] as List?)?.map((e) => e.toString()).toList() ??
+          const [];
+      if (abilities.map((e) => e.toLowerCase()).contains('reasoning'))
+        return true;
     }
-    final inferred = ModelRegistry.infer(ModelInfo(id: modelId, displayName: modelId));
+    final inferred = ModelRegistry.infer(
+      ModelInfo(id: modelId, displayName: modelId),
+    );
     return inferred.abilities.contains(ModelAbility.reasoning);
   }
 
@@ -444,6 +615,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     if (mounted && prev != loading) {
       setState(() {}); // Update input bar + drawer indicators
     }
+    _updateBackgroundExecutionState(loading);
   }
 
   Future<void> _cancelStreaming() async {
@@ -489,7 +661,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             reasoningFinishedAt: r.finishedAt,
           );
         }
-        final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+        final autoCollapse = context
+            .read<SettingsProvider>()
+            .autoCollapseThinking;
         if (autoCollapse) {
           r.expanded = false;
         }
@@ -500,7 +674,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       final segs = _reasoningSegments[streaming.id];
       if (segs != null && segs.isNotEmpty && segs.last.finishedAt == null) {
         segs.last.finishedAt = DateTime.now();
-        final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+        final autoCollapse = context
+            .read<SettingsProvider>()
+            .autoCollapseThinking;
         if (autoCollapse) {
           segs.last.expanded = false;
         }
@@ -550,7 +726,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       if (m.role == 'assistant') {
         // Restore reasoning state
         final txt = m.reasoningText ?? '';
-        if (txt.isNotEmpty || m.reasoningStartAt != null || m.reasoningFinishedAt != null) {
+        if (txt.isNotEmpty ||
+            m.reasoningStartAt != null ||
+            m.reasoningFinishedAt != null) {
           final rd = _ReasoningData();
           rd.text = txt;
           rd.startAt = m.reasoningStartAt;
@@ -564,13 +742,19 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           final events = _dedupeToolEvents(_chatService.getToolEvents(m.id));
           if (events.isNotEmpty) {
             _toolParts[m.id] = events
-                .map((e) => ToolUIPart(
-                      id: (e['id'] ?? '').toString(),
-                      toolName: (e['name'] ?? '').toString(),
-                      arguments: (e['arguments'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{},
-                      content: (e['content']?.toString().isNotEmpty == true) ? e['content'].toString() : null,
-                      loading: !(e['content']?.toString().isNotEmpty == true),
-                    ))
+                .map(
+                  (e) => ToolUIPart(
+                    id: (e['id'] ?? '').toString(),
+                    toolName: (e['name'] ?? '').toString(),
+                    arguments:
+                        (e['arguments'] as Map?)?.cast<String, dynamic>() ??
+                        const <String, dynamic>{},
+                    content: (e['content']?.toString().isNotEmpty == true)
+                        ? e['content'].toString()
+                        : null,
+                    loading: !(e['content']?.toString().isNotEmpty == true),
+                  ),
+                )
                 .toList();
           }
         } catch (_) {}
@@ -592,7 +776,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   }
 
   List<ChatMessage> _collapseVersions(List<ChatMessage> items) {
-    final Map<String, List<ChatMessage>> byGroup = <String, List<ChatMessage>>{};
+    final Map<String, List<ChatMessage>> byGroup =
+        <String, List<ChatMessage>>{};
     final List<String> order = <String>[];
     for (final m in items) {
       final gid = (m.groupId ?? m.id);
@@ -609,7 +794,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     for (final gid in order) {
       final vers = byGroup[gid]!;
       final sel = _versionSelections[gid];
-      final idx = (sel != null && sel >= 0 && sel < vers.length) ? sel : (vers.length - 1);
+      final idx = (sel != null && sel >= 0 && sel < vers.length)
+          ? sel
+          : (vers.length - 1);
       out.add(vers[idx]);
     }
     return out;
@@ -618,7 +805,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   String _clearContextLabel() {
     final l10n = AppLocalizations.of(context)!;
     final assistant = context.read<AssistantProvider>().currentAssistant;
-    final configured = (assistant?.limitContextMessages ?? true) ? (assistant?.contextMessageSize ?? 0) : 0;
+    final configured = (assistant?.limitContextMessages ?? true)
+        ? (assistant?.contextMessageSize ?? 0)
+        : 0;
     // Use collapsed view for counting
     final collapsed = _collapseVersions(_messages);
     // Map raw truncate index to collapsed start index
@@ -642,7 +831,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     }
     if (configured > 0) {
       final actual = remaining > configured ? configured : remaining;
-      return l10n.homePageClearContextWithCount(actual.toString(), configured.toString());
+      return l10n.homePageClearContextWithCount(
+        actual.toString(),
+        configured.toString(),
+      );
     }
     return l10n.homePageClearContext;
   }
@@ -650,7 +842,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   Future<void> _onClearContext() async {
     final convo = _currentConversation;
     if (convo == null) return;
-    final updated = await _chatService.toggleTruncateAtTail(convo.id, defaultTitle: _titleForLocale(context));
+    final updated = await _chatService.toggleTruncateAtTail(
+      convo.id,
+      defaultTitle: _titleForLocale(context),
+    );
     if (!mounted) return;
     if (updated != null) {
       setState(() {
@@ -703,10 +898,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     final cfg = settings.getProviderConfig(providerKey);
     final ov = cfg.modelOverrides[modelId] as Map?;
     if (ov != null) {
-      final abilities = (ov['abilities'] as List?)?.map((e) => e.toString()).toList() ?? const [];
+      final abilities =
+          (ov['abilities'] as List?)?.map((e) => e.toString()).toList() ??
+          const [];
       if (abilities.map((e) => e.toLowerCase()).contains('tool')) return true;
     }
-    final inferred = ModelRegistry.infer(ModelInfo(id: modelId, displayName: modelId));
+    final inferred = ModelRegistry.infer(
+      ModelInfo(id: modelId, displayName: modelId),
+    );
     return inferred.abilities.contains(ModelAbility.tool);
   }
 
@@ -722,14 +921,23 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     _inputFocus.unfocus();
     FocusManager.instance.primaryFocus?.unfocus();
     FocusScope.of(context).unfocus();
-    try { SystemChannels.textInput.invokeMethod('TextInput.hide'); } catch (_) {}
+    try {
+      SystemChannels.textInput.invokeMethod('TextInput.hide');
+    } catch (_) {}
   }
 
   @override
   void initState() {
     super.initState();
-    _convoFadeController = AnimationController(vsync: this, duration: const Duration(milliseconds: 180));
-    _convoFade = CurvedAnimation(parent: _convoFadeController, curve: Curves.easeOutCubic);
+    WidgetsBinding.instance.addObserver(this);
+    _convoFadeController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 180),
+    );
+    _convoFade = CurvedAnimation(
+      parent: _convoFadeController,
+      curve: Curves.easeOutCubic,
+    );
     _convoFadeController.value = 1.0;
     // Use the provided ChatService instance
     _chatService = context.read<ChatService>();
@@ -752,7 +960,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     // Attach MCP provider listener to auto-join new connected servers
     try {
       _mcpProvider = context.read<McpProvider>();
-      _connectedMcpIds = _mcpProvider!.connectedServers.map((s) => s.id).toSet();
+      _connectedMcpIds = _mcpProvider!.connectedServers
+          .map((s) => s.id)
+          .toSet();
       _mcpProvider!.addListener(_onMcpChanged);
     } catch (_) {}
 
@@ -810,7 +1020,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     setState(() {
       _tabletSidebarOpen = !_tabletSidebarOpen;
     });
-    try { context.read<SettingsProvider>().setDesktopSidebarOpen(_tabletSidebarOpen); } catch (_) {}
+    try {
+      context.read<SettingsProvider>().setDesktopSidebarOpen(
+        _tabletSidebarOpen,
+      );
+    } catch (_) {}
   }
 
   Widget _buildTabletSidebar(BuildContext context) {
@@ -826,12 +1040,12 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       })(),
       closePickerTicker: _assistantPickerCloseTick,
       loadingConversationIds: _loadingConversationIds,
-        onSelectConversation: (id) {
-          _switchConversationAnimated(id);
-        },
-        onNewConversation: () async {
-          await _createNewConversationAnimated();
-        },
+      onSelectConversation: (id) {
+        _switchConversationAnimated(id);
+      },
+      onNewConversation: () async {
+        await _createNewConversationAnimated();
+      },
     );
 
     final cs = Theme.of(context).colorScheme;
@@ -856,13 +1070,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   void _onScrollControllerChanged() {
     try {
       if (!_scrollController.hasClients) return;
-      
+
       // Detect user scrolling
-      if (_scrollController.position.userScrollDirection != ScrollDirection.idle) {
+      if (_scrollController.position.userScrollDirection !=
+          ScrollDirection.idle) {
         _isUserScrolling = true;
         // Reset chained jump anchor when user manually scrolls
         _lastJumpUserMessageId = null;
-        
+
         // Cancel previous timer and set a new one
         _userScrollTimer?.cancel();
         final secs = context.read<SettingsProvider>().autoScrollIdleSeconds;
@@ -874,7 +1089,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           }
         });
       }
-      
+
       // Only show when not near bottom
       final pos = _scrollController.position;
       final atBottom = pos.pixels >= (pos.maxScrollExtent - 24);
@@ -911,7 +1126,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   Future<void> _switchConversationAnimated(String id) async {
     // Before switching, persist any in-flight reasoning/content of current conversation
-    try { await _flushCurrentConversationProgress(); } catch (_) {}
+    try {
+      await _flushCurrentConversationProgress();
+    } catch (_) {}
     if (_currentConversation?.id == id) return;
     if (!_isDesktopPlatform) {
       try {
@@ -919,7 +1136,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       } catch (_) {}
     } else {
       // Desktop: skip fade-out to switch instantly
-      try { _convoFadeController.stop(); _convoFadeController.value = 1.0; } catch (_) {}
+      try {
+        _convoFadeController.stop();
+        _convoFadeController.value = 1.0;
+      } catch (_) {}
     }
     _chatService.setCurrentConversation(id);
     final convo = _chatService.getConversation(id);
@@ -933,25 +1153,35 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           _restoreMessageUiState();
         });
         // Ensure list lays out, then jump to bottom while hidden
-        try { await WidgetsBinding.instance.endOfFrame; } catch (_) {}
+        try {
+          await WidgetsBinding.instance.endOfFrame;
+        } catch (_) {}
         _scrollToBottom();
       }
     }
     if (mounted && !_isDesktopPlatform) {
-      try { await _convoFadeController.forward(); } catch (_) {}
+      try {
+        await _convoFadeController.forward();
+      } catch (_) {}
     }
   }
 
   Future<void> _createNewConversationAnimated() async {
     // Flush current conversation progress before creating a new one
-    try { await _flushCurrentConversationProgress(); } catch (_) {}
+    try {
+      await _flushCurrentConversationProgress();
+    } catch (_) {}
     if (!_isDesktopPlatform) {
-      try { await _convoFadeController.reverse(); } catch (_) {}
+      try {
+        await _convoFadeController.reverse();
+      } catch (_) {}
     }
     await _createNewConversation();
     if (mounted && !_isDesktopPlatform) {
       // Mobile: keep smooth fade for new conversation
-      try { await _convoFadeController.forward(); } catch (_) {}
+      try {
+        await _convoFadeController.forward();
+      } catch (_) {}
     }
   }
 
@@ -975,7 +1205,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     final out = <String>[];
     for (final f in files) {
       try {
-        final name = f.name.isNotEmpty ? f.name : DateTime.now().millisecondsSinceEpoch.toString();
+        final name = f.name.isNotEmpty
+            ? f.name
+            : DateTime.now().millisecondsSinceEpoch.toString();
         final dest = File("${dir.path}/$name");
         await dest.writeAsBytes(await f.readAsBytes());
         out.add(dest.path);
@@ -987,7 +1219,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   Future<void> _onPickPhotos() async {
     try {
       // On desktop, fall back to FilePicker as image_picker is not supported.
-      final isDesktop = defaultTargetPlatform == TargetPlatform.macOS ||
+      final isDesktop =
+          defaultTargetPlatform == TargetPlatform.macOS ||
           defaultTargetPlatform == TargetPlatform.windows ||
           defaultTargetPlatform == TargetPlatform.linux;
       if (isDesktop) {
@@ -995,7 +1228,15 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           allowMultiple: true,
           withData: false,
           type: FileType.custom,
-          allowedExtensions: const ['png','jpg','jpeg','gif','webp','heic','heif'],
+          allowedExtensions: const [
+            'png',
+            'jpg',
+            'jpeg',
+            'gif',
+            'webp',
+            'heic',
+            'heif',
+          ],
         );
         if (res == null || res.files.isEmpty) return;
         final toCopy = <XFile>[];
@@ -1040,7 +1281,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   String _inferMimeByExtension(String name) {
     final lower = name.toLowerCase();
     if (lower.endsWith('.pdf')) return 'application/pdf';
-    if (lower.endsWith('.docx')) return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    if (lower.endsWith('.docx'))
+      return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
     if (lower.endsWith('.json')) return 'application/json';
     if (lower.endsWith('.js')) return 'application/javascript';
     if (lower.endsWith('.txt') || lower.endsWith('.md')) return 'text/plain';
@@ -1066,9 +1308,26 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         type: FileType.custom,
         allowedExtensions: const [
           // images
-          'png','jpg','jpeg','gif','webp','heic','heif',
+          'png', 'jpg', 'jpeg', 'gif', 'webp', 'heic', 'heif',
           // docs
-          'txt','md','json','js','pdf','docx','html','xml','py','java','kt','dart','ts','tsx','markdown','mdx','yml','yaml'
+          'txt',
+          'md',
+          'json',
+          'js',
+          'pdf',
+          'docx',
+          'html',
+          'xml',
+          'py',
+          'java',
+          'kt',
+          'dart',
+          'ts',
+          'tsx',
+          'markdown',
+          'mdx',
+          'yml',
+          'yaml',
         ],
       );
       if (res == null || res.files.isEmpty) return;
@@ -1097,7 +1356,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         } else {
           final name = names[i];
           final mime = _inferMimeByExtension(name);
-          docs.add(DocumentAttachment(path: savedPath, fileName: name, mime: mime));
+          docs.add(
+            DocumentAttachment(path: savedPath, fileName: name, mime: mime),
+          );
         }
       }
       if (images.isNotEmpty) {
@@ -1123,7 +1384,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       final kinds = <bool>[]; // true=image, false=document
       final names = <String>[];
       for (final f in files) {
-        final name = (f.name.isNotEmpty ? f.name : (f.path.split(Platform.pathSeparator).last));
+        final name = (f.name.isNotEmpty
+            ? f.name
+            : (f.path.split(Platform.pathSeparator).last));
         toCopy.add(f);
         kinds.add(_isImageExtension(name));
         names.add(name);
@@ -1138,7 +1401,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         } else {
           final name = names[i];
           final mime = _inferMimeByExtension(name);
-          docs.add(DocumentAttachment(path: savedPath, fileName: name, mime: mime));
+          docs.add(
+            DocumentAttachment(path: savedPath, fileName: name, mime: mime),
+          );
         }
       }
       if (images.isNotEmpty) _mediaController.addImages(images);
@@ -1174,15 +1439,28 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 color: Colors.black.withOpacity(0.12),
                 child: Center(
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 24,
+                      vertical: 16,
+                    ),
                     decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.surface.withOpacity(0.95),
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.surface.withOpacity(0.95),
                       borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Theme.of(context).colorScheme.primary.withOpacity(0.4), width: 2),
+                      border: Border.all(
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.primary.withOpacity(0.4),
+                        width: 2,
+                      ),
                     ),
                     child: Text(
                       AppLocalizations.of(context)!.homePageDropToUpload,
-                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                   ),
                 ),
@@ -1195,13 +1473,18 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   Future<void> _createNewConversation() async {
     // Flush any ongoing generation progress for the current conversation
-    try { await _flushCurrentConversationProgress(); } catch (_) {}
+    try {
+      await _flushCurrentConversationProgress();
+    } catch (_) {}
     final ap = context.read<AssistantProvider>();
     final settings = context.read<SettingsProvider>();
     final assistantId = ap.currentAssistantId;
     // Don't change global default model - just use assistant's model if set
     final a = ap.currentAssistant;
-    final conversation = await _chatService.createDraftConversation(title: _titleForLocale(context), assistantId: assistantId);
+    final conversation = await _chatService.createDraftConversation(
+      title: _titleForLocale(context),
+      assistantId: assistantId,
+    );
     // Default-enable MCP: select all connected servers for this conversation
     // MCP defaults are now managed per assistant; no per-conversation enabling here
     setState(() {
@@ -1228,7 +1511,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             content: content,
           );
           if (mounted) {
-            setState(() { _messages.add(m); });
+            setState(() {
+              _messages.add(m);
+            });
           }
         }
       }
@@ -1281,14 +1566,16 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   Future<void> _sendMessage(ChatInputData input) async {
     final content = input.text.trim();
-    if (content.isEmpty && input.imagePaths.isEmpty && input.documents.isEmpty) return;
+    if (content.isEmpty && input.imagePaths.isEmpty && input.documents.isEmpty)
+      return;
     if (_currentConversation == null) await _createNewConversation();
 
     final settings = context.read<SettingsProvider>();
     final assistant = context.read<AssistantProvider>().currentAssistant;
-    
+
     // Use assistant's model if set, otherwise fall back to global default
-    final providerKey = assistant?.chatModelProvider ?? settings.currentModelProvider;
+    final providerKey =
+        assistant?.chatModelProvider ?? settings.currentModelProvider;
     final modelId = assistant?.chatModelId ?? settings.currentModelId;
 
     if (providerKey == null || modelId == null) {
@@ -1304,7 +1591,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     // Add user message
     // Persist user message; append image and document markers for display
     final imageMarkers = input.imagePaths.map((p) => '\n[image:$p]').join();
-    final docMarkers = input.documents.map((d) => '\n[file:${d.path}|${d.fileName}|${d.mime}]').join();
+    final docMarkers = input.documents
+        .map((d) => '\n[file:${d.path}|${d.fileName}|${d.mime}]')
+        .join();
     final userMessage = await _chatService.addMessage(
       conversationId: _currentConversation!.id,
       role: 'user',
@@ -1347,7 +1636,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
     // Initialize reasoning state only when enabled and model supports it
     final supportsReasoning = _isReasoningModel(providerKey, modelId);
-    final enableReasoning = supportsReasoning && _isReasoningEnabled((assistant?.thinkingBudget) ?? settings.thinkingBudget);
+    final enableReasoning =
+        supportsReasoning &&
+        _isReasoningEnabled(
+          (assistant?.thinkingBudget) ?? settings.thinkingBudget,
+        );
     if (enableReasoning) {
       final rd = _ReasoningData();
       _reasoning[assistantMessage.id] = rd;
@@ -1365,16 +1658,19 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     // Prepare messages for API
     // Apply truncateIndex and collapse versions first, then transform the last user message to include document content
     final tIndex = _currentConversation?.truncateIndex ?? -1;
-    final List<ChatMessage> sourceAll = (tIndex >= 0 && tIndex <= _messages.length)
+    final List<ChatMessage> sourceAll =
+        (tIndex >= 0 && tIndex <= _messages.length)
         ? _messages.sublist(tIndex)
         : List.of(_messages);
     final List<ChatMessage> source = _collapseVersions(sourceAll);
     final apiMessages = source
         .where((m) => m.content.isNotEmpty)
-        .map((m) => {
-              'role': m.role == 'assistant' ? 'assistant' : 'user',
-              'content': m.content,
-            })
+        .map(
+          (m) => {
+            'role': m.role == 'assistant' ? 'assistant' : 'user',
+            'content': m.content,
+          },
+        )
         .toList();
 
     // Build document prompts and clean markers in last user message
@@ -1382,7 +1678,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       // Find last user message index in apiMessages
       int lastUserIdx = -1;
       for (int i = apiMessages.length - 1; i >= 0; i--) {
-        if (apiMessages[i]['role'] == 'user') { lastUserIdx = i; break; }
+        if (apiMessages[i]['role'] == 'user') {
+          lastUserIdx = i;
+          break;
+        }
       }
       if (lastUserIdx != -1) {
         final raw = (apiMessages[lastUserIdx]['content'] ?? '').toString();
@@ -1394,7 +1693,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         final filePrompts = StringBuffer();
         for (final d in input.documents) {
           try {
-            final text = await DocumentTextExtractor.extract(path: d.path, mime: d.mime);
+            final text = await DocumentTextExtractor.extract(
+              path: d.path,
+              mime: d.mime,
+            );
             filePrompts.writeln('## user sent a file: ${d.fileName}');
             filePrompts.writeln('<content>');
             filePrompts.writeln('```');
@@ -1407,7 +1709,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         final merged = (filePrompts.toString() + cleaned).trim();
         final userText = merged.isEmpty ? cleaned : merged;
         // Apply message template if set
-        final templ = (assistant?.messageTemplate ?? '{{ message }}').trim().isEmpty
+        final templ =
+            (assistant?.messageTemplate ?? '{{ message }}').trim().isEmpty
             ? '{{ message }}'
             : (assistant!.messageTemplate);
         final templated = PromptTransformer.applyMessageTemplate(
@@ -1429,7 +1732,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         modelName: modelId,
         userNickname: context.read<UserProvider>().name,
       );
-      final sys = PromptTransformer.replacePlaceholders(assistant.systemPrompt, vars);
+      final sys = PromptTransformer.replacePlaceholders(
+        assistant.systemPrompt,
+        vars,
+      );
       apiMessages.insert(0, {'role': 'system', 'content': sys});
     }
 
@@ -1440,7 +1746,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         final mems = mp.getForAssistant(assistant!.id);
         final buf = StringBuffer();
         buf.writeln('## Memories');
-        buf.writeln('These are memories that you can reference in the future conversations.');
+        buf.writeln(
+          'These are memories that you can reference in the future conversations.',
+        );
         buf.writeln('<memories>');
         for (final m in mems) {
           buf.writeln('<record>');
@@ -1474,7 +1782,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 你可以在和用户闲聊的时候暗示用户你能记住东西。
 ''');
         if (apiMessages.isNotEmpty && apiMessages.first['role'] == 'system') {
-          apiMessages[0]['content'] = ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + buf.toString();
+          apiMessages[0]['content'] =
+              ((apiMessages[0]['content'] ?? '') as String) +
+              '\n\n' +
+              buf.toString();
         } else {
           apiMessages.insert(0, {'role': 'system', 'content': buf.toString()});
         }
@@ -1499,7 +1810,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           }
           sb.writeln('</recent_chats>');
           if (apiMessages.isNotEmpty && apiMessages.first['role'] == 'system') {
-            apiMessages[0]['content'] = ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + sb.toString();
+            apiMessages[0]['content'] =
+                ((apiMessages[0]['content'] ?? '') as String) +
+                '\n\n' +
+                sb.toString();
           } else {
             apiMessages.insert(0, {'role': 'system', 'content': sb.toString()});
           }
@@ -1513,7 +1827,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       try {
         final cfg = settings.getProviderConfig(providerKey);
         // Only official Gemini API supports built-in search
-        if (cfg.providerType != ProviderKind.google || (cfg.vertexAI == true)) return false;
+        if (cfg.providerType != ProviderKind.google || (cfg.vertexAI == true))
+          return false;
         final ov = cfg.modelOverrides[modelId] as Map?;
         final list = (ov?['builtInTools'] as List?) ?? const <dynamic>[];
         return list.map((e) => e.toString().toLowerCase()).contains('search');
@@ -1521,13 +1836,15 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         return false;
       }
     }
+
     final hasBuiltInSearch = _hasBuiltInGeminiSearch();
 
     // Optionally inject search tool usage guide (when search is enabled and not using Gemini built-in search)
     if (settings.searchEnabled && !hasBuiltInSearch) {
       final prompt = SearchToolService.getSystemPrompt();
       if (apiMessages.isNotEmpty && apiMessages.first['role'] == 'system') {
-        apiMessages[0]['content'] = ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + prompt;
+        apiMessages[0]['content'] =
+            ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + prompt;
       } else {
         apiMessages.insert(0, {'role': 'system', 'content': prompt});
       }
@@ -1538,7 +1855,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       if (lmEnabled) {
         final lp = await LearningModeStore.getPrompt();
         if (apiMessages.isNotEmpty && apiMessages.first['role'] == 'system') {
-          apiMessages[0]['content'] = ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + lp;
+          apiMessages[0]['content'] =
+              ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + lp;
         } else {
           apiMessages.insert(0, {'role': 'system', 'content': lp});
         }
@@ -1546,7 +1864,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     } catch (_) {}
 
     // Limit context length according to assistant settings
-    if ((assistant?.limitContextMessages ?? true) && (assistant?.contextMessageSize ?? 0) > 0) {
+    if ((assistant?.limitContextMessages ?? true) &&
+        (assistant?.contextMessageSize ?? 0) > 0) {
       final keep = assistant!.contextMessageSize.clamp(1, 512).toInt();
       // Always keep the first message if it's system
       int startIdx = 0;
@@ -1566,7 +1885,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     for (int i = 0; i < apiMessages.length; i++) {
       final s = (apiMessages[i]['content'] ?? '').toString();
       if (s.isNotEmpty) {
-        apiMessages[i]['content'] = await MarkdownMediaSanitizer.inlineLocalImagesToBase64(s);
+        apiMessages[i]['content'] =
+            await MarkdownMediaSanitizer.inlineLocalImagesToBase64(s);
       }
     }
 
@@ -1605,11 +1925,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               'parameters': {
                 'type': 'object',
                 'properties': {
-                  'content': {'type': 'string', 'description': 'The content of the memory record'}
+                  'content': {
+                    'type': 'string',
+                    'description': 'The content of the memory record',
+                  },
                 },
-                'required': ['content']
-              }
-            }
+                'required': ['content'],
+              },
+            },
           },
           {
             'type': 'function',
@@ -1619,12 +1942,18 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               'parameters': {
                 'type': 'object',
                 'properties': {
-                  'id': {'type': 'integer', 'description': 'The id of the memory record'},
-                  'content': {'type': 'string', 'description': 'The content of the memory record'}
+                  'id': {
+                    'type': 'integer',
+                    'description': 'The id of the memory record',
+                  },
+                  'content': {
+                    'type': 'string',
+                    'description': 'The content of the memory record',
+                  },
                 },
-                'required': ['id', 'content']
-              }
-            }
+                'required': ['id', 'content'],
+              },
+            },
           },
           {
             'type': 'function',
@@ -1634,11 +1963,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               'parameters': {
                 'type': 'object',
                 'properties': {
-                  'id': {'type': 'integer', 'description': 'The id of the memory record'}
+                  'id': {
+                    'type': 'integer',
+                    'description': 'The id of the memory record',
+                  },
                 },
-                'required': ['id']
-              }
-            }
+                'required': ['id'],
+              },
+            },
           },
         ]);
       }
@@ -1646,30 +1978,52 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       // MCP tools
       final mcp = context.read<McpProvider>();
       final toolSvc = context.read<McpToolService>();
-      final tools = toolSvc.listAvailableToolsForAssistant(mcp, context.read<AssistantProvider>(), assistant?.id);
+      final tools = toolSvc.listAvailableToolsForAssistant(
+        mcp,
+        context.read<AssistantProvider>(),
+        assistant?.id,
+      );
       if (supportsTools && tools.isNotEmpty) {
         final providerCfg = settings.getProviderConfig(providerKey);
-        final providerKind = ProviderConfig.classify(providerCfg.id, explicitType: providerCfg.providerType);
-        toolDefs.addAll(tools.map((t) {
-          // Base schema from server or fallback
-          Map<String, dynamic> baseSchema;
-          if (t.schema != null && t.schema!.isNotEmpty) {
-            baseSchema = Map<String, dynamic>.from(t.schema!);
-          } else {
-            final props = <String, dynamic>{for (final p in t.params) p.name: {'type': (p.type ?? 'string')}};
-            final required = [for (final p in t.params.where((e) => e.required)) p.name];
-            baseSchema = {'type': 'object', 'properties': props, if (required.isNotEmpty) 'required': required};
-          }
-          final sanitized = _sanitizeToolParametersForProvider(baseSchema, providerKind);
-          return {
-            'type': 'function',
-            'function': {
-              'name': t.name,
-              if ((t.description ?? '').isNotEmpty) 'description': t.description,
-              'parameters': sanitized,
+        final providerKind = ProviderConfig.classify(
+          providerCfg.id,
+          explicitType: providerCfg.providerType,
+        );
+        toolDefs.addAll(
+          tools.map((t) {
+            // Base schema from server or fallback
+            Map<String, dynamic> baseSchema;
+            if (t.schema != null && t.schema!.isNotEmpty) {
+              baseSchema = Map<String, dynamic>.from(t.schema!);
+            } else {
+              final props = <String, dynamic>{
+                for (final p in t.params)
+                  p.name: {'type': (p.type ?? 'string')},
+              };
+              final required = [
+                for (final p in t.params.where((e) => e.required)) p.name,
+              ];
+              baseSchema = {
+                'type': 'object',
+                'properties': props,
+                if (required.isNotEmpty) 'required': required,
+              };
             }
-          };
-        }));
+            final sanitized = _sanitizeToolParametersForProvider(
+              baseSchema,
+              providerKind,
+            );
+            return {
+              'type': 'function',
+              'function': {
+                'name': t.name,
+                if ((t.description ?? '').isNotEmpty)
+                  'description': t.description,
+                'parameters': sanitized,
+              },
+            };
+          }),
+        );
       }
 
       if (toolDefs.isNotEmpty) {
@@ -1685,7 +2039,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               if (name == 'create_memory') {
                 final content = (args['content'] ?? '').toString();
                 if (content.isEmpty) return '';
-                final m = await mp.add(assistantId: assistant!.id, content: content);
+                final m = await mp.add(
+                  assistantId: assistant!.id,
+                  content: content,
+                );
                 return m.content;
               } else if (name == 'edit_memory') {
                 final id = (args['id'] as num?)?.toInt() ?? -1;
@@ -1719,7 +2076,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       if ((assistant?.customHeaders.isNotEmpty ?? false)) {
         aHeaders = {
           for (final e in assistant!.customHeaders)
-            if ((e['name'] ?? '').trim().isNotEmpty) (e['name']!.trim()): (e['value'] ?? '')
+            if ((e['name'] ?? '').trim().isNotEmpty)
+              (e['name']!.trim()): (e['value'] ?? ''),
         };
         if (aHeaders.isEmpty) aHeaders = null;
       }
@@ -1727,21 +2085,21 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         aBody = {
           for (final e in assistant!.customBody)
             if ((e['key'] ?? '').trim().isNotEmpty)
-              (e['key']!.trim()): (e['value'] ?? '')
+              (e['key']!.trim()): (e['value'] ?? ''),
         };
         if (aBody.isEmpty) aBody = null;
       }
 
-    final stream = ChatApiService.sendMessageStream(
-      config: config,
-      modelId: modelId,
-      messages: apiMessages,
-      userImagePaths: input.imagePaths,
-      thinkingBudget: assistant?.thinkingBudget ?? settings.thinkingBudget,
-      temperature: assistant?.temperature,
-      topP: assistant?.topP,
-      maxTokens: assistant?.maxTokens,
-      tools: toolDefs.isEmpty ? null : toolDefs,
+      final stream = ChatApiService.sendMessageStream(
+        config: config,
+        modelId: modelId,
+        messages: apiMessages,
+        userImagePaths: input.imagePaths,
+        thinkingBudget: assistant?.thinkingBudget ?? settings.thinkingBudget,
+        temperature: assistant?.temperature,
+        topP: assistant?.topP,
+        maxTokens: assistant?.maxTokens,
+        tools: toolDefs.isEmpty ? null : toolDefs,
         onToolCall: onToolCall,
         extraHeaders: aHeaders,
         extraBody: aBody,
@@ -1761,7 +2119,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           _titleQueued = true;
         }
         // Replace extremely long inline base64 images with local files to avoid jank
-        final processedContent = await MarkdownMediaSanitizer.replaceInlineBase64Images(fullContent);
+        final processedContent =
+            await MarkdownMediaSanitizer.replaceInlineBase64Images(fullContent);
         await _chatService.updateMessage(
           assistantMessage.id,
           content: processedContent,
@@ -1770,7 +2129,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         );
         if (!mounted) return;
         setState(() {
-          final index = _messages.indexWhere((m) => m.id == assistantMessage.id);
+          final index = _messages.indexWhere(
+            (m) => m.id == assistantMessage.id,
+          );
           if (index != -1) {
             _messages[index] = _messages[index].copyWith(
               content: processedContent,
@@ -1785,7 +2146,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           if (r.finishedAt == null) {
             r.finishedAt = DateTime.now();
           }
-          final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+          final autoCollapse = context
+              .read<SettingsProvider>()
+              .autoCollapseThinking;
           if (autoCollapse) {
             r.expanded = false; // auto close after finish
           }
@@ -1795,9 +2158,13 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
         // Also finish any unfinished reasoning segments
         final segments = _reasoningSegments[assistantMessage.id];
-        if (segments != null && segments.isNotEmpty && segments.last.finishedAt == null) {
+        if (segments != null &&
+            segments.isNotEmpty &&
+            segments.last.finishedAt == null) {
           segments.last.finishedAt = DateTime.now();
-          final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+          final autoCollapse = context
+              .read<SettingsProvider>()
+              .autoCollapseThinking;
           if (autoCollapse) {
             segments.last.expanded = false;
           }
@@ -1821,7 +2188,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       final String _cidForStream = assistantMessage.conversationId;
       await _conversationStreams[_cidForStream]?.cancel();
       final _sub = stream.listen(
-            (chunk) async {
+        (chunk) async {
           // Capture reasoning deltas only when reasoning is enabled
           if ((chunk.reasoning ?? '').isNotEmpty && supportsReasoning) {
             if (streamOutput) {
@@ -1833,28 +2200,36 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               _reasoning[assistantMessage.id] = r;
 
               // Add to reasoning segments for mixed display
-              final segments = _reasoningSegments[assistantMessage.id] ?? <_ReasoningSegmentData>[];
+              final segments =
+                  _reasoningSegments[assistantMessage.id] ??
+                  <_ReasoningSegmentData>[];
 
               if (segments.isEmpty) {
                 // First reasoning segment
                 final newSegment = _ReasoningSegmentData();
                 newSegment.text = chunk.reasoning!;
                 newSegment.startAt = DateTime.now();
-                newSegment.expanded = false; // default collapsed while generating
-                newSegment.toolStartIndex = (_toolParts[assistantMessage.id]?.length ?? 0);
+                newSegment.expanded =
+                    false; // default collapsed while generating
+                newSegment.toolStartIndex =
+                    (_toolParts[assistantMessage.id]?.length ?? 0);
                 segments.add(newSegment);
               } else {
                 // Check if we should start a new segment (after tool calls)
-                final hasToolsAfterLastSegment = (_toolParts[assistantMessage.id]?.isNotEmpty ?? false);
+                final hasToolsAfterLastSegment =
+                    (_toolParts[assistantMessage.id]?.isNotEmpty ?? false);
                 final lastSegment = segments.last;
 
-                if (hasToolsAfterLastSegment && lastSegment.finishedAt != null) {
+                if (hasToolsAfterLastSegment &&
+                    lastSegment.finishedAt != null) {
                   // Start a new segment after tools
                   final newSegment = _ReasoningSegmentData();
                   newSegment.text = chunk.reasoning!;
                   newSegment.startAt = DateTime.now();
-                  newSegment.expanded = false; // default collapsed while generating
-                  newSegment.toolStartIndex = (_toolParts[assistantMessage.id]?.length ?? 0);
+                  newSegment.expanded =
+                      false; // default collapsed while generating
+                  newSegment.toolStartIndex =
+                      (_toolParts[assistantMessage.id]?.length ?? 0);
                   segments.add(newSegment);
                 } else {
                   // Continue current segment
@@ -1870,7 +2245,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 reasoningSegmentsJson: _serializeReasoningSegments(segments),
               );
 
-              if (mounted && _currentConversation?.id == _cidForStream) setState(() {});
+              if (mounted && _currentConversation?.id == _cidForStream)
+                setState(() {});
               await _chatService.updateMessage(
                 assistantMessage.id,
                 reasoningText: r.text,
@@ -1891,10 +2267,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           // MCP tool call placeholders
           if ((chunk.toolCalls ?? const []).isNotEmpty) {
             // Finish current reasoning segment if exists, and auto-collapse per settings
-            final segments = _reasoningSegments[assistantMessage.id] ?? <_ReasoningSegmentData>[];
+            final segments =
+                _reasoningSegments[assistantMessage.id] ??
+                <_ReasoningSegmentData>[];
             if (segments.isNotEmpty && segments.last.finishedAt == null) {
               segments.last.finishedAt = DateTime.now();
-              final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+              final autoCollapse = context
+                  .read<SettingsProvider>()
+                  .autoCollapseThinking;
               if (autoCollapse) {
                 segments.last.expanded = false;
                 final rd = _reasoning[assistantMessage.id];
@@ -1910,13 +2290,25 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
             // Simply append new tool calls instead of merging by ID/name
             // This allows multiple calls to the same tool
-            final existing = List<ToolUIPart>.of(_toolParts[assistantMessage.id] ?? const []);
+            final existing = List<ToolUIPart>.of(
+              _toolParts[assistantMessage.id] ?? const [],
+            );
             for (final c in chunk.toolCalls!) {
-              existing.add(ToolUIPart(id: c.id, toolName: c.name, arguments: c.arguments, loading: true));
+              existing.add(
+                ToolUIPart(
+                  id: c.id,
+                  toolName: c.name,
+                  arguments: c.arguments,
+                  loading: true,
+                ),
+              );
             }
-            if (mounted && _currentConversation?.id == _cidForStream) setState(() {
-              _toolParts[assistantMessage.id] = _dedupeToolPartsList(existing);
-            });
+            if (mounted && _currentConversation?.id == _cidForStream)
+              setState(() {
+                _toolParts[assistantMessage.id] = _dedupeToolPartsList(
+                  existing,
+                );
+              });
 
             // Persist placeholders - append new events
             try {
@@ -1931,19 +2323,26 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                     'content': null,
                   },
               ];
-              await _chatService.setToolEvents(assistantMessage.id, _dedupeToolEvents(newEvents));
+              await _chatService.setToolEvents(
+                assistantMessage.id,
+                _dedupeToolEvents(newEvents),
+              );
             } catch (_) {}
           }
 
           // MCP tool results -> hydrate placeholders in-place (avoid extra tool message cards)
           if ((chunk.toolResults ?? const []).isNotEmpty) {
-            final parts = List<ToolUIPart>.of(_toolParts[assistantMessage.id] ?? const []);
+            final parts = List<ToolUIPart>.of(
+              _toolParts[assistantMessage.id] ?? const [],
+            );
             for (final r in chunk.toolResults!) {
               // Find the first loading tool with matching ID or name
               // This ensures we update the correct placeholder even with multiple same-name tools
               int idx = -1;
               for (int i = 0; i < parts.length; i++) {
-                if (parts[i].loading && (parts[i].id == r.id || (parts[i].id.isEmpty && parts[i].toolName == r.name))) {
+                if (parts[i].loading &&
+                    (parts[i].id == r.id ||
+                        (parts[i].id.isEmpty && parts[i].toolName == r.name))) {
                   idx = i;
                   break;
                 }
@@ -1953,7 +2352,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 parts[idx] = ToolUIPart(
                   id: parts[idx].id,
                   toolName: parts[idx].toolName,
-                  arguments: (r.arguments is Map && (r.arguments as Map).isNotEmpty)
+                  arguments:
+                      (r.arguments is Map && (r.arguments as Map).isNotEmpty)
                       ? Map<String, dynamic>.from(r.arguments)
                       : parts[idx].arguments,
                   content: r.content,
@@ -1961,13 +2361,15 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 );
               } else {
                 // If we didn't see the placeholder (edge case), append a finished part
-                parts.add(ToolUIPart(
-                  id: r.id,
-                  toolName: r.name,
-                  arguments: r.arguments,
-                  content: r.content,
-                  loading: false,
-                ));
+                parts.add(
+                  ToolUIPart(
+                    id: r.id,
+                    toolName: r.name,
+                    arguments: r.arguments,
+                    content: r.content,
+                    loading: false,
+                  ),
+                );
               }
               // Persist each event update
               try {
@@ -1980,9 +2382,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 );
               } catch (_) {}
             }
-            if (mounted && _currentConversation?.id == _cidForStream) setState(() {
-              _toolParts[assistantMessage.id] = _dedupeToolPartsList(parts);
-            });
+            if (mounted && _currentConversation?.id == _cidForStream)
+              setState(() {
+                _toolParts[assistantMessage.id] = _dedupeToolPartsList(parts);
+              });
             if (!_isUserScrolling) {
               _scrollToBottomSoon();
             }
@@ -1990,7 +2393,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
           if (chunk.isDone) {
             // Guard: if we have any loading tool-call placeholders, a follow-up round is coming.
-            final hasLoadingTool = (_toolParts[assistantMessage.id]?.any((p) => p.loading) ?? false);
+            final hasLoadingTool =
+                (_toolParts[assistantMessage.id]?.any((p) => p.loading) ??
+                false);
             if (hasLoadingTool) {
               // Skip finishing now; wait for follow-up round.
               return;
@@ -2014,13 +2419,16 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 reasoningStartAt: startAt,
                 reasoningFinishedAt: now,
               );
-              final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+              final autoCollapse = context
+                  .read<SettingsProvider>()
+                  .autoCollapseThinking;
               _reasoning[assistantMessage.id] = _ReasoningData()
                 ..text = _bufferedReasoning
                 ..startAt = startAt
                 ..finishedAt = now
                 ..expanded = !autoCollapse;
-              if (mounted && _currentConversation?.id == _cidForStream) setState(() {});
+              if (mounted && _currentConversation?.id == _cidForStream)
+                setState(() {});
             }
             await _conversationStreams.remove(_cidForStream)?.cancel();
             final r = _reasoning[assistantMessage.id];
@@ -2055,7 +2463,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 final r = _reasoning[assistantMessage.id];
                 if (r != null && r.startAt != null && r.finishedAt == null) {
                   r.finishedAt = DateTime.now();
-                  final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+                  final autoCollapse = context
+                      .read<SettingsProvider>()
+                      .autoCollapseThinking;
                   if (autoCollapse) {
                     r.expanded = false; // collapse once main content starts
                   }
@@ -2070,9 +2480,13 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
                 // Also finish the current reasoning segment
                 final segments = _reasoningSegments[assistantMessage.id];
-                if (segments != null && segments.isNotEmpty && segments.last.finishedAt == null) {
+                if (segments != null &&
+                    segments.isNotEmpty &&
+                    segments.last.finishedAt == null) {
                   segments.last.finishedAt = DateTime.now();
-                  final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+                  final autoCollapse = context
+                      .read<SettingsProvider>()
+                      .autoCollapseThinking;
                   if (autoCollapse) {
                     segments.last.expanded = false;
                   }
@@ -2081,7 +2495,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                   // Persist closed segment state
                   await _chatService.updateMessage(
                     assistantMessage.id,
-                    reasoningSegmentsJson: _serializeReasoningSegments(segments),
+                    reasoningSegmentsJson: _serializeReasoningSegments(
+                      segments,
+                    ),
                   );
                 }
               }
@@ -2091,7 +2507,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               // Update UI with streaming content
               if (mounted && _currentConversation?.id == _cidForStream) {
                 setState(() {
-                  final index = _messages.indexWhere((m) => m.id == assistantMessage.id);
+                  final index = _messages.indexWhere(
+                    (m) => m.id == assistantMessage.id,
+                  );
                   if (index != -1) {
                     _messages[index] = _messages[index].copyWith(
                       content: fullContent,
@@ -2111,7 +2529,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         },
         onError: (e) async {
           // Preserve partial content; if empty, write error message into bubble
-          final errText = '${AppLocalizations.of(context)!.generationInterrupted}: $e';
+          final errText =
+              '${AppLocalizations.of(context)!.generationInterrupted}: $e';
           final displayContent = fullContent.isNotEmpty ? fullContent : errText;
           await _chatService.updateMessage(
             assistantMessage.id,
@@ -2122,7 +2541,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
           if (!mounted) return;
           setState(() {
-            final index = _messages.indexWhere((m) => m.id == assistantMessage.id);
+            final index = _messages.indexWhere(
+              (m) => m.id == assistantMessage.id,
+            );
             if (index != -1) {
               _messages[index] = _messages[index].copyWith(
                 content: displayContent,
@@ -2144,7 +2565,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 reasoningFinishedAt: r.finishedAt,
               );
             }
-            final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+            final autoCollapse = context
+                .read<SettingsProvider>()
+                .autoCollapseThinking;
             if (autoCollapse) {
               r.expanded = false;
             }
@@ -2153,9 +2576,13 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
           // Also finish any unfinished reasoning segments on error
           final segments = _reasoningSegments[assistantMessage.id];
-          if (segments != null && segments.isNotEmpty && segments.last.finishedAt == null) {
+          if (segments != null &&
+              segments.isNotEmpty &&
+              segments.last.finishedAt == null) {
             segments.last.finishedAt = DateTime.now();
-            final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+            final autoCollapse = context
+                .read<SettingsProvider>()
+                .autoCollapseThinking;
             if (autoCollapse) {
               segments.last.expanded = false;
             }
@@ -2172,7 +2599,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           await _conversationStreams.remove(_cidForStream)?.cancel();
           showAppSnackBar(
             context,
-            message: '${AppLocalizations.of(context)!.generationInterrupted}: $e',
+            message:
+                '${AppLocalizations.of(context)!.generationInterrupted}: $e',
             type: NotificationType.error,
           );
         },
@@ -2188,7 +2616,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       _conversationStreams[_cidForStream] = _sub;
     } catch (e) {
       // Preserve partial content on outer error as well; if empty, show error text in bubble
-      final errText = '${AppLocalizations.of(context)!.generationInterrupted}: $e';
+      final errText =
+          '${AppLocalizations.of(context)!.generationInterrupted}: $e';
       final displayContent = fullContent.isNotEmpty ? fullContent : errText;
       await _chatService.updateMessage(
         assistantMessage.id,
@@ -2213,7 +2642,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       final r = _reasoning[assistantMessage.id];
       if (r != null) {
         r.finishedAt = DateTime.now();
-        final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+        final autoCollapse = context
+            .read<SettingsProvider>()
+            .autoCollapseThinking;
         if (autoCollapse) {
           r.expanded = false;
         }
@@ -2227,9 +2658,13 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
       // Also finish any unfinished reasoning segments on error
       final segments = _reasoningSegments[assistantMessage.id];
-      if (segments != null && segments.isNotEmpty && segments.last.finishedAt == null) {
+      if (segments != null &&
+          segments.isNotEmpty &&
+          segments.last.finishedAt == null) {
         segments.last.finishedAt = DateTime.now();
-        final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+        final autoCollapse = context
+            .read<SettingsProvider>()
+            .autoCollapseThinking;
         if (autoCollapse) {
           segments.last.expanded = false;
         }
@@ -2243,7 +2678,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         } catch (_) {}
       }
 
-      await _conversationStreams.remove(assistantMessage.conversationId)?.cancel();
+      await _conversationStreams
+          .remove(assistantMessage.conversationId)
+          ?.cancel();
       showAppSnackBar(
         context,
         message: '${AppLocalizations.of(context)!.generationInterrupted}: $e',
@@ -2283,13 +2720,19 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       int userFirst = -1;
       for (int i = 0; i < _messages.length; i++) {
         final gid0 = (_messages[i].groupId ?? _messages[i].id);
-        if (gid0 == userGroupId) { userFirst = i; break; }
+        if (gid0 == userGroupId) {
+          userFirst = i;
+          break;
+        }
       }
       if (userFirst < 0) userFirst = idx; // fallback
 
       int aid = -1;
       for (int i = userFirst + 1; i < _messages.length; i++) {
-        if (_messages[i].role == 'assistant') { aid = i; break; }
+        if (_messages[i].role == 'assistant') {
+          aid = i;
+          break;
+        }
       }
       if (aid >= 0) {
         lastKeep = aid; // keep that assistant message as old version
@@ -2330,7 +2773,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         if (!shouldKeep) removeIds.add(m.id);
       }
       for (final id in removeIds) {
-        try { await _chatService.deleteMessage(id); } catch (_) {}
+        try {
+          await _chatService.deleteMessage(id);
+        } catch (_) {}
         _reasoning.remove(id);
         _translations.remove(id);
         _toolParts.remove(id);
@@ -2346,9 +2791,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     // Start a new assistant generation from current context
     final settings = context.read<SettingsProvider>();
     final assistant = context.read<AssistantProvider>().currentAssistant;
-    
+
     // Use assistant's model if set, otherwise fall back to global default
-    final providerKey = assistant?.chatModelProvider ?? settings.currentModelProvider;
+    final providerKey =
+        assistant?.chatModelProvider ?? settings.currentModelProvider;
     final modelId = assistant?.chatModelId ?? settings.currentModelId;
 
     if (providerKey == null || modelId == null) {
@@ -2376,7 +2822,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     // Persist selection to the latest version of this group
     final gid = assistantMessage.groupId ?? assistantMessage.id;
     _versionSelections[gid] = assistantMessage.version;
-    await _chatService.setSelectedVersion(_currentConversation!.id, gid, assistantMessage.version);
+    await _chatService.setSelectedVersion(
+      _currentConversation!.id,
+      gid,
+      assistantMessage.version,
+    );
 
     setState(() {
       _messages.add(assistantMessage);
@@ -2392,22 +2842,35 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
     // Initialize reasoning state only when enabled and model supports it
     final supportsReasoning = _isReasoningModel(providerKey, modelId);
-    final enableReasoning = supportsReasoning && _isReasoningEnabled((assistant?.thinkingBudget) ?? settings.thinkingBudget);
+    final enableReasoning =
+        supportsReasoning &&
+        _isReasoningEnabled(
+          (assistant?.thinkingBudget) ?? settings.thinkingBudget,
+        );
     if (enableReasoning) {
       final rd = _ReasoningData();
       _reasoning[assistantMessage.id] = rd;
-      await _chatService.updateMessage(assistantMessage.id, reasoningStartAt: DateTime.now());
+      await _chatService.updateMessage(
+        assistantMessage.id,
+        reasoningStartAt: DateTime.now(),
+      );
     }
 
     // Build API messages from current context (apply truncate + collapse versions)
     final tIndex = _currentConversation?.truncateIndex ?? -1;
-    final List<ChatMessage> sourceAll = (tIndex >= 0 && tIndex <= _messages.length)
+    final List<ChatMessage> sourceAll =
+        (tIndex >= 0 && tIndex <= _messages.length)
         ? _messages.sublist(tIndex)
         : List.of(_messages);
     final List<ChatMessage> source = _collapseVersions(sourceAll);
     final apiMessages = source
         .where((m) => m.content.isNotEmpty)
-        .map((m) => {'role': m.role == 'assistant' ? 'assistant' : 'user', 'content': m.content})
+        .map(
+          (m) => {
+            'role': m.role == 'assistant' ? 'assistant' : 'user',
+            'content': m.content,
+          },
+        )
         .toList();
 
     // Inject system prompt
@@ -2419,7 +2882,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         modelName: modelId,
         userNickname: context.read<UserProvider>().name,
       );
-      final sys = PromptTransformer.replacePlaceholders(assistant.systemPrompt, vars);
+      final sys = PromptTransformer.replacePlaceholders(
+        assistant.systemPrompt,
+        vars,
+      );
       apiMessages.insert(0, {'role': 'system', 'content': sys});
     }
     // Inject Memories + Recent Chats
@@ -2429,7 +2895,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         final mems = mp.getForAssistant(assistant!.id);
         final buf = StringBuffer();
         buf.writeln('## Memories');
-        buf.writeln('These are memories that you can reference in the future conversations.');
+        buf.writeln(
+          'These are memories that you can reference in the future conversations.',
+        );
         buf.writeln('<memories>');
         for (final m in mems) {
           buf.writeln('<record>');
@@ -2462,7 +2930,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 你可以在和用户闲聊的时候暗示用户你能记住东西。
 ''');
         if (apiMessages.isNotEmpty && apiMessages.first['role'] == 'system') {
-          apiMessages[0]['content'] = ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + buf.toString();
+          apiMessages[0]['content'] =
+              ((apiMessages[0]['content'] ?? '') as String) +
+              '\n\n' +
+              buf.toString();
         } else {
           apiMessages.insert(0, {'role': 'system', 'content': buf.toString()});
         }
@@ -2487,7 +2958,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           }
           sb.writeln('</recent_chats>');
           if (apiMessages.isNotEmpty && apiMessages.first['role'] == 'system') {
-            apiMessages[0]['content'] = ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + sb.toString();
+            apiMessages[0]['content'] =
+                ((apiMessages[0]['content'] ?? '') as String) +
+                '\n\n' +
+                sb.toString();
           } else {
             apiMessages.insert(0, {'role': 'system', 'content': sb.toString()});
           }
@@ -2498,7 +2972,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     if (settings.searchEnabled) {
       final prompt = SearchToolService.getSystemPrompt();
       if (apiMessages.isNotEmpty && apiMessages.first['role'] == 'system') {
-        apiMessages[0]['content'] = ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + prompt;
+        apiMessages[0]['content'] =
+            ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + prompt;
       } else {
         apiMessages.insert(0, {'role': 'system', 'content': prompt});
       }
@@ -2509,7 +2984,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       if (lmEnabled) {
         final lp = await LearningModeStore.getPrompt();
         if (apiMessages.isNotEmpty && apiMessages.first['role'] == 'system') {
-          apiMessages[0]['content'] = ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + lp;
+          apiMessages[0]['content'] =
+              ((apiMessages[0]['content'] ?? '') as String) + '\n\n' + lp;
         } else {
           apiMessages.insert(0, {'role': 'system', 'content': lp});
         }
@@ -2517,7 +2993,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     } catch (_) {}
 
     // Limit context length
-    if ((assistant?.limitContextMessages ?? true) && (assistant?.contextMessageSize ?? 0) > 0) {
+    if ((assistant?.limitContextMessages ?? true) &&
+        (assistant?.contextMessageSize ?? 0) > 0) {
       final keep = assistant!.contextMessageSize.clamp(1, 512).toInt();
       int startIdx = 0;
       if (apiMessages.isNotEmpty && apiMessages.first['role'] == 'system') {
@@ -2526,7 +3003,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       final tail = apiMessages.sublist(startIdx);
       if (tail.length > keep) {
         final trimmed = tail.sublist(tail.length - keep);
-        apiMessages..removeRange(startIdx, apiMessages.length)..addAll(trimmed);
+        apiMessages
+          ..removeRange(startIdx, apiMessages.length)
+          ..addAll(trimmed);
       }
     }
 
@@ -2534,7 +3013,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     for (int i = 0; i < apiMessages.length; i++) {
       final s = (apiMessages[i]['content'] ?? '').toString();
       if (s.isNotEmpty) {
-        apiMessages[i]['content'] = await MarkdownMediaSanitizer.inlineLocalImagesToBase64(s);
+        apiMessages[i]['content'] =
+            await MarkdownMediaSanitizer.inlineLocalImagesToBase64(s);
       }
     }
 
@@ -2542,7 +3022,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     final List<Map<String, dynamic>> toolDefs = <Map<String, dynamic>>[];
     Future<String> Function(String, Map<String, dynamic>)? onToolCall;
     try {
-      if (assistant?.enableMemory == true && _isToolModel(providerKey, modelId)) {
+      if (assistant?.enableMemory == true &&
+          _isToolModel(providerKey, modelId)) {
         toolDefs.addAll([
           {
             'type': 'function',
@@ -2552,11 +3033,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               'parameters': {
                 'type': 'object',
                 'properties': {
-                  'content': {'type': 'string', 'description': 'The content of the memory record'}
+                  'content': {
+                    'type': 'string',
+                    'description': 'The content of the memory record',
+                  },
                 },
-                'required': ['content']
-              }
-            }
+                'required': ['content'],
+              },
+            },
           },
           {
             'type': 'function',
@@ -2566,12 +3050,18 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               'parameters': {
                 'type': 'object',
                 'properties': {
-                  'id': {'type': 'integer', 'description': 'The id of the memory record'},
-                  'content': {'type': 'string', 'description': 'The content of the memory record'}
+                  'id': {
+                    'type': 'integer',
+                    'description': 'The id of the memory record',
+                  },
+                  'content': {
+                    'type': 'string',
+                    'description': 'The content of the memory record',
+                  },
                 },
-                'required': ['id', 'content']
-              }
-            }
+                'required': ['id', 'content'],
+              },
+            },
           },
           {
             'type': 'function',
@@ -2581,11 +3071,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               'parameters': {
                 'type': 'object',
                 'properties': {
-                  'id': {'type': 'integer', 'description': 'The id of the memory record'}
+                  'id': {
+                    'type': 'integer',
+                    'description': 'The id of the memory record',
+                  },
                 },
-                'required': ['id']
-              }
-            }
+                'required': ['id'],
+              },
+            },
           },
         ]);
       }
@@ -2594,30 +3087,52 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       }
       final mcp = context.read<McpProvider>();
       final toolSvc = context.read<McpToolService>();
-      final tools = toolSvc.listAvailableToolsForAssistant(mcp, context.read<AssistantProvider>(), assistant?.id);
+      final tools = toolSvc.listAvailableToolsForAssistant(
+        mcp,
+        context.read<AssistantProvider>(),
+        assistant?.id,
+      );
       final supportsTools = _isToolModel(providerKey, modelId);
       if (supportsTools && tools.isNotEmpty) {
         final providerCfg = settings.getProviderConfig(providerKey);
-        final providerKind = ProviderConfig.classify(providerCfg.id, explicitType: providerCfg.providerType);
-        toolDefs.addAll(tools.map((t) {
-          Map<String, dynamic> baseSchema;
-          if (t.schema != null && t.schema!.isNotEmpty) {
-            baseSchema = Map<String, dynamic>.from(t.schema!);
-          } else {
-            final props = <String, dynamic>{for (final p in t.params) p.name: {'type': (p.type ?? 'string')}};
-            final required = [for (final p in t.params.where((e) => e.required)) p.name];
-            baseSchema = {'type': 'object', 'properties': props, if (required.isNotEmpty) 'required': required};
-          }
-          final sanitized = _sanitizeToolParametersForProvider(baseSchema, providerKind);
-          return {
-            'type': 'function',
-            'function': {
-              'name': t.name,
-              if ((t.description ?? '').isNotEmpty) 'description': t.description,
-              'parameters': sanitized,
+        final providerKind = ProviderConfig.classify(
+          providerCfg.id,
+          explicitType: providerCfg.providerType,
+        );
+        toolDefs.addAll(
+          tools.map((t) {
+            Map<String, dynamic> baseSchema;
+            if (t.schema != null && t.schema!.isNotEmpty) {
+              baseSchema = Map<String, dynamic>.from(t.schema!);
+            } else {
+              final props = <String, dynamic>{
+                for (final p in t.params)
+                  p.name: {'type': (p.type ?? 'string')},
+              };
+              final required = [
+                for (final p in t.params.where((e) => e.required)) p.name,
+              ];
+              baseSchema = {
+                'type': 'object',
+                'properties': props,
+                if (required.isNotEmpty) 'required': required,
+              };
             }
-          };
-        }));
+            final sanitized = _sanitizeToolParametersForProvider(
+              baseSchema,
+              providerKind,
+            );
+            return {
+              'type': 'function',
+              'function': {
+                'name': t.name,
+                if ((t.description ?? '').isNotEmpty)
+                  'description': t.description,
+                'parameters': sanitized,
+              },
+            };
+          }),
+        );
       }
       if (toolDefs.isNotEmpty) {
         onToolCall = (name, args) async {
@@ -2632,7 +3147,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               if (name == 'create_memory') {
                 final content = (args['content'] ?? '').toString();
                 if (content.isEmpty) return '';
-                final m = await mp.add(assistantId: assistant!.id, content: content);
+                final m = await mp.add(
+                  assistantId: assistant!.id,
+                  content: content,
+                );
                 return m.content;
               } else if (name == 'edit_memory') {
                 final id = (args['id'] as num?)?.toInt() ?? -1;
@@ -2666,7 +3184,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     if ((assistant?.customHeaders.isNotEmpty ?? false)) {
       aHeaders = {
         for (final e in assistant!.customHeaders)
-          if ((e['name'] ?? '').trim().isNotEmpty) (e['name']!.trim()): (e['value'] ?? '')
+          if ((e['name'] ?? '').trim().isNotEmpty)
+            (e['name']!.trim()): (e['value'] ?? ''),
       };
       if (aHeaders.isEmpty) aHeaders = null;
     }
@@ -2674,7 +3193,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       aBody = {
         for (final e in assistant!.customBody)
           if ((e['key'] ?? '').trim().isNotEmpty)
-            (e['key']!.trim()): (e['value'] ?? '')
+            (e['key']!.trim()): (e['value'] ?? ''),
       };
       if (aBody.isEmpty) aBody = null;
     }
@@ -2703,97 +3222,372 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     DateTime? _reasoningStartAt2;
 
     Future<void> finish({bool generateTitle = false}) async {
-      final processedContent = await MarkdownMediaSanitizer.replaceInlineBase64Images(fullContent);
-      await _chatService.updateMessage(assistantMessage.id, content: processedContent, totalTokens: totalTokens, isStreaming: false);
+      final processedContent =
+          await MarkdownMediaSanitizer.replaceInlineBase64Images(fullContent);
+      await _chatService.updateMessage(
+        assistantMessage.id,
+        content: processedContent,
+        totalTokens: totalTokens,
+        isStreaming: false,
+      );
       if (!mounted) return;
       setState(() {
         final index = _messages.indexWhere((m) => m.id == assistantMessage.id);
         if (index != -1) {
-          _messages[index] = _messages[index].copyWith(content: processedContent, totalTokens: totalTokens, isStreaming: false);
+          _messages[index] = _messages[index].copyWith(
+            content: processedContent,
+            totalTokens: totalTokens,
+            isStreaming: false,
+          );
         }
       });
       _setConversationLoading(assistantMessage.conversationId, false);
       final r = _reasoning[assistantMessage.id];
       if (r != null && r.finishedAt == null) {
         r.finishedAt = DateTime.now();
-        await _chatService.updateMessage(assistantMessage.id, reasoningText: r.text, reasoningFinishedAt: r.finishedAt);
+        await _chatService.updateMessage(
+          assistantMessage.id,
+          reasoningText: r.text,
+          reasoningFinishedAt: r.finishedAt,
+        );
       }
       final segments = _reasoningSegments[assistantMessage.id];
-      if (segments != null && segments.isNotEmpty && segments.last.finishedAt == null) {
+      if (segments != null &&
+          segments.isNotEmpty &&
+          segments.last.finishedAt == null) {
         segments.last.finishedAt = DateTime.now();
-        final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
+        final autoCollapse = context
+            .read<SettingsProvider>()
+            .autoCollapseThinking;
         if (autoCollapse) segments.last.expanded = false;
         _reasoningSegments[assistantMessage.id] = segments;
         if (mounted) setState(() {});
-        await _chatService.updateMessage(assistantMessage.id, reasoningSegmentsJson: _serializeReasoningSegments(segments));
+        await _chatService.updateMessage(
+          assistantMessage.id,
+          reasoningSegmentsJson: _serializeReasoningSegments(segments),
+        );
       }
     }
 
     final String _cid = assistantMessage.conversationId;
     await _conversationStreams[_cid]?.cancel();
-    final _sub2 = stream.listen((chunk) async {
-      // Always capture reasoning if provided by model, even when toggle is off
-      if ((chunk.reasoning ?? '').isNotEmpty) {
-        if (streamOutput) {
-          final r = _reasoning[assistantMessage.id] ?? _ReasoningData();
-          r.text += chunk.reasoning!;
-          r.startAt ??= DateTime.now();
-          // keep finishedAt as-is; don't reset to null once set
-          r.expanded = false; // default collapsed while generating
-          _reasoning[assistantMessage.id] = r;
-          final segments = _reasoningSegments[assistantMessage.id] ?? <_ReasoningSegmentData>[];
-          if (segments.isEmpty) {
-            final seg = _ReasoningSegmentData();
-            seg.text = chunk.reasoning!;
-            seg.startAt = DateTime.now();
-            seg.expanded = false; // default collapsed while generating
-            seg.toolStartIndex = (_toolParts[assistantMessage.id]?.length ?? 0);
-            segments.add(seg);
-          } else {
-            final last = segments.last;
-            if ((_toolParts[assistantMessage.id]?.isNotEmpty ?? false) && last.finishedAt != null) {
+    final _sub2 = stream.listen(
+      (chunk) async {
+        // Always capture reasoning if provided by model, even when toggle is off
+        if ((chunk.reasoning ?? '').isNotEmpty) {
+          if (streamOutput) {
+            final r = _reasoning[assistantMessage.id] ?? _ReasoningData();
+            r.text += chunk.reasoning!;
+            r.startAt ??= DateTime.now();
+            // keep finishedAt as-is; don't reset to null once set
+            r.expanded = false; // default collapsed while generating
+            _reasoning[assistantMessage.id] = r;
+            final segments =
+                _reasoningSegments[assistantMessage.id] ??
+                <_ReasoningSegmentData>[];
+            if (segments.isEmpty) {
               final seg = _ReasoningSegmentData();
               seg.text = chunk.reasoning!;
               seg.startAt = DateTime.now();
               seg.expanded = false; // default collapsed while generating
-              seg.toolStartIndex = (_toolParts[assistantMessage.id]?.length ?? 0);
+              seg.toolStartIndex =
+                  (_toolParts[assistantMessage.id]?.length ?? 0);
               segments.add(seg);
             } else {
-              last.text += chunk.reasoning!;
-              last.startAt ??= DateTime.now();
+              final last = segments.last;
+              if ((_toolParts[assistantMessage.id]?.isNotEmpty ?? false) &&
+                  last.finishedAt != null) {
+                final seg = _ReasoningSegmentData();
+                seg.text = chunk.reasoning!;
+                seg.startAt = DateTime.now();
+                seg.expanded = false; // default collapsed while generating
+                seg.toolStartIndex =
+                    (_toolParts[assistantMessage.id]?.length ?? 0);
+                segments.add(seg);
+              } else {
+                last.text += chunk.reasoning!;
+                last.startAt ??= DateTime.now();
+              }
             }
+            _reasoningSegments[assistantMessage.id] = segments;
+            if (mounted) setState(() {});
+            await _chatService.updateMessage(
+              assistantMessage.id,
+              reasoningText: r.text,
+              reasoningStartAt: r.startAt,
+              reasoningSegmentsJson: _serializeReasoningSegments(segments),
+            );
+          } else {
+            // Buffer in UI; still persist progress so it survives navigation
+            _reasoningStartAt2 ??= DateTime.now();
+            _bufferedReasoning2 += chunk.reasoning!;
+            await _chatService.updateMessage(
+              assistantMessage.id,
+              reasoningText: _bufferedReasoning2,
+              reasoningStartAt: _reasoningStartAt2,
+            );
           }
-          _reasoningSegments[assistantMessage.id] = segments;
-          if (mounted) setState(() {});
-          await _chatService.updateMessage(
-            assistantMessage.id,
-            reasoningText: r.text,
-            reasoningStartAt: r.startAt,
-            reasoningSegmentsJson: _serializeReasoningSegments(segments),
-          );
-        } else {
-          // Buffer in UI; still persist progress so it survives navigation
-          _reasoningStartAt2 ??= DateTime.now();
-          _bufferedReasoning2 += chunk.reasoning!;
-          await _chatService.updateMessage(
-            assistantMessage.id,
-            reasoningText: _bufferedReasoning2,
-            reasoningStartAt: _reasoningStartAt2,
-          );
         }
-      }
 
-      if ((chunk.toolCalls ?? const []).isNotEmpty) {
-        // Finish current reasoning segment if one is open, so follow-up reasoning becomes a new card
-        final segments = _reasoningSegments[assistantMessage.id] ?? <_ReasoningSegmentData>[];
-        if (segments.isNotEmpty && segments.last.finishedAt == null) {
-          segments.last.finishedAt = DateTime.now();
-          final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
-          if (autoCollapse) {
-            segments.last.expanded = false;
-            final rd = _reasoning[assistantMessage.id];
-            if (rd != null) rd.expanded = false;
+        if ((chunk.toolCalls ?? const []).isNotEmpty) {
+          // Finish current reasoning segment if one is open, so follow-up reasoning becomes a new card
+          final segments =
+              _reasoningSegments[assistantMessage.id] ??
+              <_ReasoningSegmentData>[];
+          if (segments.isNotEmpty && segments.last.finishedAt == null) {
+            segments.last.finishedAt = DateTime.now();
+            final autoCollapse = context
+                .read<SettingsProvider>()
+                .autoCollapseThinking;
+            if (autoCollapse) {
+              segments.last.expanded = false;
+              final rd = _reasoning[assistantMessage.id];
+              if (rd != null) rd.expanded = false;
+            }
+            _reasoningSegments[assistantMessage.id] = segments;
+            try {
+              await _chatService.updateMessage(
+                assistantMessage.id,
+                reasoningSegmentsJson: _serializeReasoningSegments(segments),
+              );
+            } catch (_) {}
           }
+
+          final existing = List<ToolUIPart>.of(
+            _toolParts[assistantMessage.id] ?? const [],
+          );
+          for (final c in chunk.toolCalls!) {
+            existing.add(
+              ToolUIPart(
+                id: c.id,
+                toolName: c.name,
+                arguments: c.arguments,
+                loading: true,
+              ),
+            );
+          }
+          setState(
+            () => _toolParts[assistantMessage.id] = _dedupeToolPartsList(
+              existing,
+            ),
+          );
+          try {
+            final prev = _chatService.getToolEvents(assistantMessage.id);
+            final newEvents = <Map<String, dynamic>>[
+              ...prev,
+              for (final c in chunk.toolCalls!)
+                {
+                  'id': c.id,
+                  'name': c.name,
+                  'arguments': c.arguments,
+                  'content': null,
+                },
+            ];
+            await _chatService.setToolEvents(
+              assistantMessage.id,
+              _dedupeToolEvents(newEvents),
+            );
+          } catch (_) {}
+        }
+
+        if ((chunk.toolResults ?? const []).isNotEmpty) {
+          final parts = List<ToolUIPart>.of(
+            _toolParts[assistantMessage.id] ?? const [],
+          );
+          for (final r in chunk.toolResults!) {
+            int idx = -1;
+            for (int i = 0; i < parts.length; i++) {
+              if (parts[i].loading &&
+                  (parts[i].id == r.id ||
+                      (parts[i].id.isEmpty && parts[i].toolName == r.name))) {
+                idx = i;
+                break;
+              }
+            }
+            if (idx >= 0) {
+              parts[idx] = ToolUIPart(
+                id: parts[idx].id,
+                toolName: parts[idx].toolName,
+                arguments: parts[idx].arguments,
+                content: r.content,
+                loading: false,
+              );
+            } else {
+              parts.add(
+                ToolUIPart(
+                  id: r.id,
+                  toolName: r.name,
+                  arguments: r.arguments,
+                  content: r.content,
+                  loading: false,
+                ),
+              );
+            }
+            try {
+              await _chatService.upsertToolEvent(
+                assistantMessage.id,
+                id: r.id,
+                name: r.name,
+                arguments: r.arguments,
+                content: r.content,
+              );
+            } catch (_) {}
+          }
+          setState(
+            () => _toolParts[assistantMessage.id] = _dedupeToolPartsList(parts),
+          );
+          if (!_isUserScrolling) {
+            _scrollToBottomSoon();
+          }
+        }
+
+        if (chunk.content.isNotEmpty) {
+          fullContent += chunk.content;
+
+          // Respect auto-collapse setting when main content starts: always stop timer, collapse only if enabled
+          final rd = _reasoning[assistantMessage.id];
+          if (rd != null && rd.startAt != null && rd.finishedAt == null) {
+            rd.finishedAt = DateTime.now();
+            final autoCollapse = context
+                .read<SettingsProvider>()
+                .autoCollapseThinking;
+            if (autoCollapse) rd.expanded = false;
+            _reasoning[assistantMessage.id] = rd;
+            try {
+              await _chatService.updateMessage(
+                assistantMessage.id,
+                reasoningText: rd.text,
+                reasoningFinishedAt: rd.finishedAt,
+              );
+            } catch (_) {}
+            if (mounted) setState(() {});
+          }
+          final segs = _reasoningSegments[assistantMessage.id];
+          if (segs != null && segs.isNotEmpty && segs.last.finishedAt == null) {
+            segs.last.finishedAt = DateTime.now();
+            final autoCollapse = context
+                .read<SettingsProvider>()
+                .autoCollapseThinking;
+            if (autoCollapse) segs.last.expanded = false;
+            _reasoningSegments[assistantMessage.id] = segs;
+            try {
+              await _chatService.updateMessage(
+                assistantMessage.id,
+                reasoningSegmentsJson: _serializeReasoningSegments(segs),
+              );
+            } catch (_) {}
+            if (mounted) setState(() {});
+          }
+
+          // Always persist partial content, even if streaming UI is off
+          try {
+            await _chatService.updateMessage(
+              assistantMessage.id,
+              content: fullContent,
+              totalTokens: totalTokens,
+            );
+          } catch (_) {}
+
+          if (streamOutput) {
+            setState(() {
+              final i = _messages.indexWhere(
+                (m) => m.id == assistantMessage.id,
+              );
+              if (i != -1)
+                _messages[i] = _messages[i].copyWith(content: fullContent);
+            });
+          }
+        }
+
+        if (chunk.usage != null) {
+          usage = (usage ?? const TokenUsage()).merge(chunk.usage!);
+          totalTokens = usage!.totalTokens;
+        }
+
+        if (chunk.isDone) {
+          if (chunk.totalTokens > 0) totalTokens = chunk.totalTokens;
+          await finish();
+          // If non-streaming, write buffered reasoning once
+          if (!streamOutput && _bufferedReasoning2.isNotEmpty) {
+            final now = DateTime.now();
+            final startAt = _reasoningStartAt2 ?? now;
+            await _chatService.updateMessage(
+              assistantMessage.id,
+              reasoningText: _bufferedReasoning2,
+              reasoningStartAt: startAt,
+              reasoningFinishedAt: now,
+            );
+            final autoCollapse = context
+                .read<SettingsProvider>()
+                .autoCollapseThinking;
+            _reasoning[assistantMessage.id] = _ReasoningData()
+              ..text = _bufferedReasoning2
+              ..startAt = startAt
+              ..finishedAt = now
+              ..expanded = !autoCollapse;
+            if (mounted) setState(() {});
+          }
+          await _conversationStreams.remove(_cid)?.cancel();
+        }
+      },
+      onError: (e) async {
+        // When regenerate fails, persist error text into this assistant bubble
+        final errText =
+            '${AppLocalizations.of(context)!.generationInterrupted}: $e';
+        final displayContent = fullContent.isNotEmpty ? fullContent : errText;
+        await _chatService.updateMessage(
+          assistantMessage.id,
+          content: displayContent,
+          totalTokens: totalTokens,
+          isStreaming: false,
+        );
+
+        if (mounted) {
+          setState(() {
+            final index = _messages.indexWhere(
+              (m) => m.id == assistantMessage.id,
+            );
+            if (index != -1) {
+              _messages[index] = _messages[index].copyWith(
+                content: displayContent,
+                isStreaming: false,
+                totalTokens: totalTokens,
+              );
+            }
+          });
+        }
+        _setConversationLoading(assistantMessage.conversationId, false);
+
+        // End reasoning on error
+        final r = _reasoning[assistantMessage.id];
+        if (r != null) {
+          if (r.finishedAt == null) {
+            r.finishedAt = DateTime.now();
+            try {
+              await _chatService.updateMessage(
+                assistantMessage.id,
+                reasoningText: r.text,
+                reasoningFinishedAt: r.finishedAt,
+              );
+            } catch (_) {}
+          }
+          final autoCollapse = context
+              .read<SettingsProvider>()
+              .autoCollapseThinking;
+          if (autoCollapse) r.expanded = false;
+          _reasoning[assistantMessage.id] = r;
+        }
+
+        // Also finish any unfinished reasoning segments on error
+        final segments = _reasoningSegments[assistantMessage.id];
+        if (segments != null &&
+            segments.isNotEmpty &&
+            segments.last.finishedAt == null) {
+          segments.last.finishedAt = DateTime.now();
+          final autoCollapse = context
+              .read<SettingsProvider>()
+              .autoCollapseThinking;
+          if (autoCollapse) segments.last.expanded = false;
           _reasoningSegments[assistantMessage.id] = segments;
           try {
             await _chatService.updateMessage(
@@ -2803,193 +3597,18 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           } catch (_) {}
         }
 
-        final existing = List<ToolUIPart>.of(_toolParts[assistantMessage.id] ?? const []);
-        for (final c in chunk.toolCalls!) {
-          existing.add(ToolUIPart(id: c.id, toolName: c.name, arguments: c.arguments, loading: true));
-        }
-        setState(() => _toolParts[assistantMessage.id] = _dedupeToolPartsList(existing));
-        try {
-          final prev = _chatService.getToolEvents(assistantMessage.id);
-          final newEvents = <Map<String, dynamic>>[
-            ...prev,
-            for (final c in chunk.toolCalls!) {'id': c.id, 'name': c.name, 'arguments': c.arguments, 'content': null},
-          ];
-          await _chatService.setToolEvents(assistantMessage.id, _dedupeToolEvents(newEvents));
-        } catch (_) {}
-      }
-
-      if ((chunk.toolResults ?? const []).isNotEmpty) {
-        final parts = List<ToolUIPart>.of(_toolParts[assistantMessage.id] ?? const []);
-        for (final r in chunk.toolResults!) {
-          int idx = -1;
-          for (int i = 0; i < parts.length; i++) {
-            if (parts[i].loading && (parts[i].id == r.id || (parts[i].id.isEmpty && parts[i].toolName == r.name))) {
-              idx = i; break;
-            }
-          }
-          if (idx >= 0) {
-            parts[idx] = ToolUIPart(id: parts[idx].id, toolName: parts[idx].toolName, arguments: parts[idx].arguments, content: r.content, loading: false);
-          } else {
-            parts.add(ToolUIPart(id: r.id, toolName: r.name, arguments: r.arguments, content: r.content, loading: false));
-          }
-          try { await _chatService.upsertToolEvent(assistantMessage.id, id: r.id, name: r.name, arguments: r.arguments, content: r.content); } catch (_) {}
-        }
-        setState(() => _toolParts[assistantMessage.id] = _dedupeToolPartsList(parts));
-        if (!_isUserScrolling) {
-          _scrollToBottomSoon();
-        }
-      }
-
-      if (chunk.content.isNotEmpty) {
-        fullContent += chunk.content;
-
-        // Respect auto-collapse setting when main content starts: always stop timer, collapse only if enabled
-        final rd = _reasoning[assistantMessage.id];
-        if (rd != null && rd.startAt != null && rd.finishedAt == null) {
-          rd.finishedAt = DateTime.now();
-          final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
-          if (autoCollapse) rd.expanded = false;
-          _reasoning[assistantMessage.id] = rd;
-          try {
-            await _chatService.updateMessage(
-              assistantMessage.id,
-              reasoningText: rd.text,
-              reasoningFinishedAt: rd.finishedAt,
-            );
-          } catch (_) {}
-          if (mounted) setState(() {});
-        }
-        final segs = _reasoningSegments[assistantMessage.id];
-        if (segs != null && segs.isNotEmpty && segs.last.finishedAt == null) {
-          segs.last.finishedAt = DateTime.now();
-          final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
-          if (autoCollapse) segs.last.expanded = false;
-          _reasoningSegments[assistantMessage.id] = segs;
-          try {
-            await _chatService.updateMessage(
-              assistantMessage.id,
-              reasoningSegmentsJson: _serializeReasoningSegments(segs),
-            );
-          } catch (_) {}
-          if (mounted) setState(() {});
-        }
-
-        // Always persist partial content, even if streaming UI is off
-        try {
-          await _chatService.updateMessage(
-            assistantMessage.id,
-            content: fullContent,
-            totalTokens: totalTokens,
-          );
-        } catch (_) {}
-
-        if (streamOutput) {
-          setState(() {
-            final i = _messages.indexWhere((m) => m.id == assistantMessage.id);
-            if (i != -1) _messages[i] = _messages[i].copyWith(content: fullContent);
-          });
-        }
-      }
-
-      if (chunk.usage != null) {
-        usage = (usage ?? const TokenUsage()).merge(chunk.usage!);
-        totalTokens = usage!.totalTokens;
-      }
-
-      if (chunk.isDone) {
-        if (chunk.totalTokens > 0) totalTokens = chunk.totalTokens;
-        await finish();
-        // If non-streaming, write buffered reasoning once
-        if (!streamOutput && _bufferedReasoning2.isNotEmpty) {
-          final now = DateTime.now();
-          final startAt = _reasoningStartAt2 ?? now;
-          await _chatService.updateMessage(
-            assistantMessage.id,
-            reasoningText: _bufferedReasoning2,
-            reasoningStartAt: startAt,
-            reasoningFinishedAt: now,
-          );
-          final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
-          _reasoning[assistantMessage.id] = _ReasoningData()
-            ..text = _bufferedReasoning2
-            ..startAt = startAt
-            ..finishedAt = now
-            ..expanded = !autoCollapse;
-          if (mounted) setState(() {});
-        }
         await _conversationStreams.remove(_cid)?.cancel();
-      }
-    },
-    onError: (e) async {
-      // When regenerate fails, persist error text into this assistant bubble
-      final errText = '${AppLocalizations.of(context)!.generationInterrupted}: $e';
-      final displayContent = fullContent.isNotEmpty ? fullContent : errText;
-      await _chatService.updateMessage(
-        assistantMessage.id,
-        content: displayContent,
-        totalTokens: totalTokens,
-        isStreaming: false,
-      );
-
-      if (mounted) {
-        setState(() {
-          final index = _messages.indexWhere((m) => m.id == assistantMessage.id);
-          if (index != -1) {
-            _messages[index] = _messages[index].copyWith(
-              content: displayContent,
-              isStreaming: false,
-              totalTokens: totalTokens,
-            );
-          }
-        });
-      }
-      _setConversationLoading(assistantMessage.conversationId, false);
-
-      // End reasoning on error
-      final r = _reasoning[assistantMessage.id];
-      if (r != null) {
-        if (r.finishedAt == null) {
-          r.finishedAt = DateTime.now();
-          try {
-            await _chatService.updateMessage(
-              assistantMessage.id,
-              reasoningText: r.text,
-              reasoningFinishedAt: r.finishedAt,
-            );
-          } catch (_) {}
-        }
-        final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
-        if (autoCollapse) r.expanded = false;
-        _reasoning[assistantMessage.id] = r;
-      }
-
-      // Also finish any unfinished reasoning segments on error
-      final segments = _reasoningSegments[assistantMessage.id];
-      if (segments != null && segments.isNotEmpty && segments.last.finishedAt == null) {
-        segments.last.finishedAt = DateTime.now();
-        final autoCollapse = context.read<SettingsProvider>().autoCollapseThinking;
-        if (autoCollapse) segments.last.expanded = false;
-        _reasoningSegments[assistantMessage.id] = segments;
-        try {
-          await _chatService.updateMessage(
-            assistantMessage.id,
-            reasoningSegmentsJson: _serializeReasoningSegments(segments),
-          );
-        } catch (_) {}
-      }
-
-      await _conversationStreams.remove(_cid)?.cancel();
-      showAppSnackBar(
-        context,
-        message: '${AppLocalizations.of(context)!.generationInterrupted}: $e',
-        type: NotificationType.error,
-      );
-    },
-    onDone: () async {
-      // Stream ended; ensure subscription cleanup
-      await _conversationStreams.remove(_cid)?.cancel();
-    },
-    cancelOnError: true,
+        showAppSnackBar(
+          context,
+          message: '${AppLocalizations.of(context)!.generationInterrupted}: $e',
+          type: NotificationType.error,
+        );
+      },
+      onDone: () async {
+        // Stream ended; ensure subscription cleanup
+        await _conversationStreams.remove(_cid)?.cancel();
+      },
+      cancelOnError: true,
     );
     _conversationStreams[_cid] = _sub2;
   }
@@ -3021,7 +3640,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       buffer.write(raw[idx]);
       idx++;
     }
-    return ChatInputData(text: buffer.toString().trim(), imagePaths: images, documents: docs);
+    return ChatInputData(
+      text: buffer.toString().trim(),
+      imagePaths: images,
+      documents: docs,
+    );
   }
 
   Future<void> _maybeGenerateTitle({bool force = false}) async {
@@ -3030,10 +3653,16 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     await _maybeGenerateTitleFor(convo.id, force: force);
   }
 
-  Future<void> _maybeGenerateTitleFor(String conversationId, {bool force = false}) async {
+  Future<void> _maybeGenerateTitleFor(
+    String conversationId, {
+    bool force = false,
+  }) async {
     final convo = _chatService.getConversation(conversationId);
     if (convo == null) return;
-    if (!force && convo.title.isNotEmpty && convo.title != _titleForLocale(context)) return;
+    if (!force &&
+        convo.title.isNotEmpty &&
+        convo.title != _titleForLocale(context))
+      return;
 
     final settings = context.read<SettingsProvider>();
     final assistantProvider = context.read<AssistantProvider>();
@@ -3044,23 +3673,30 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         : assistantProvider.currentAssistant;
 
     // Decide model: prefer title model, else fall back to assistant's model, then to global default
-    final provKey = settings.titleModelProvider
-        ?? assistant?.chatModelProvider
-        ?? settings.currentModelProvider;
-    final mdlId = settings.titleModelId
-        ?? assistant?.chatModelId
-        ?? settings.currentModelId;
+    final provKey =
+        settings.titleModelProvider ??
+        assistant?.chatModelProvider ??
+        settings.currentModelProvider;
+    final mdlId =
+        settings.titleModelId ??
+        assistant?.chatModelId ??
+        settings.currentModelId;
     if (provKey == null || mdlId == null) return;
     final cfg = settings.getProviderConfig(provKey);
 
     // Build content from messages (truncate to reasonable length)
     final msgs = _chatService.getMessages(convo.id);
     final tIndex = convo.truncateIndex;
-    final List<ChatMessage> sourceAll = (tIndex >= 0 && tIndex <= msgs.length) ? msgs.sublist(tIndex) : msgs;
+    final List<ChatMessage> sourceAll = (tIndex >= 0 && tIndex <= msgs.length)
+        ? msgs.sublist(tIndex)
+        : msgs;
     final List<ChatMessage> source = _collapseVersions(sourceAll);
     final joined = source
         .where((m) => m.content.isNotEmpty)
-        .map((m) => '${m.role == 'assistant' ? 'Assistant' : 'User'}: ${m.content}')
+        .map(
+          (m) =>
+              '${m.role == 'assistant' ? 'Assistant' : 'User'}: ${m.content}',
+        )
         .join('\n\n');
     final content = joined.length > 3000 ? joined.substring(0, 3000) : joined;
     final locale = Localizations.localeOf(context).toLanguageTag();
@@ -3070,7 +3706,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         .replaceAll('{content}', content);
 
     try {
-      final title = (await ChatApiService.generateText(config: cfg, modelId: mdlId, prompt: prompt)).trim();
+      final title = (await ChatApiService.generateText(
+        config: cfg,
+        modelId: mdlId,
+        prompt: prompt,
+      )).trim();
       if (title.isNotEmpty) {
         await _chatService.renameConversation(convo.id, title);
         if (mounted && _currentConversation?.id == convo.id) {
@@ -3087,7 +3727,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   void _scrollToBottom() {
     try {
       if (!_scrollController.hasClients) return;
-      
+
       // Prevent using controller while it is still attached to old/new list simultaneously
       if (_scrollController.positions.length != 1) {
         // Try again after microtask when the previous list detaches
@@ -3146,25 +3786,33 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     final assistantPhrases = assistant != null
         ? quickPhraseProvider.getForAssistant(assistant.id)
         : <QuickPhrase>[];
-    
+
     final allAvailable = [...globalPhrases, ...assistantPhrases];
     if (allAvailable.isEmpty) return;
 
     // Get input bar height for positioning menu above it
-    final RenderBox? inputBox = _inputBarKey.currentContext?.findRenderObject() as RenderBox?;
+    final RenderBox? inputBox =
+        _inputBarKey.currentContext?.findRenderObject() as RenderBox?;
     if (inputBox == null) return;
-    
+
     final inputBarHeight = inputBox.size.height;
     final topLeft = inputBox.localToGlobal(Offset.zero);
-    final position = Offset(topLeft.dx, inputBarHeight); // dx = global left, dy = input height
-    
+    final position = Offset(
+      topLeft.dx,
+      inputBarHeight,
+    ); // dx = global left, dy = input height
+
     // Dismiss keyboard before showing menu to prevent flickering
     _dismissKeyboard();
-    
+
     QuickPhrase? selected;
     try {
       if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
-        selected = await showDesktopQuickPhrasePopover(context, anchorKey: _inputBarKey, phrases: allAvailable);
+        selected = await showDesktopQuickPhrasePopover(
+          context,
+          anchorKey: _inputBarKey,
+          phrases: allAvailable,
+        );
       } else {
         selected = await showQuickPhraseMenu(
           context: context,
@@ -3184,22 +3832,27 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       // Insert content at cursor position
       final text = _inputController.text;
       final selection = _inputController.selection;
-      final start = (selection.start >= 0 && selection.start <= text.length) 
-          ? selection.start 
+      final start = (selection.start >= 0 && selection.start <= text.length)
+          ? selection.start
           : text.length;
-      final end = (selection.end >= 0 && selection.end <= text.length && selection.end >= start) 
-          ? selection.end 
+      final end =
+          (selection.end >= 0 &&
+              selection.end <= text.length &&
+              selection.end >= start)
+          ? selection.end
           : start;
-      
+
       final newText = text.replaceRange(start, end, selected.content);
       _inputController.value = _inputController.value.copyWith(
         text: newText,
-        selection: TextSelection.collapsed(offset: start + selected.content.length),
+        selection: TextSelection.collapsed(
+          offset: start + selected.content.length,
+        ),
         composing: TextRange.empty,
       );
-      
+
       setState(() {});
-      
+
       // Don't auto-refocus to prevent keyboard flickering on Android
       // User can tap input field if they want to continue typing
     }
@@ -3231,12 +3884,20 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       final pos0 = _scrollController.position;
       final denom = (messages.length - 1).clamp(1, 1 << 30);
       final ratio = tIndex / denom;
-      final coarse = (pos0.maxScrollExtent * ratio).clamp(0.0, pos0.maxScrollExtent);
+      final coarse = (pos0.maxScrollExtent * ratio).clamp(
+        0.0,
+        pos0.maxScrollExtent,
+      );
       _scrollController.jumpTo(coarse);
       await WidgetsBinding.instance.endOfFrame;
       final tCtxAfterCoarse = _messageKeys[targetId]?.currentContext;
       if (tCtxAfterCoarse != null) {
-        await Scrollable.ensureVisible(tCtxAfterCoarse, alignment: 0.1, duration: const Duration(milliseconds: 220), curve: Curves.easeOutCubic);
+        await Scrollable.ensureVisible(
+          tCtxAfterCoarse,
+          alignment: 0.1,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+        );
         _lastJumpUserMessageId = targetId;
         return;
       }
@@ -3244,7 +3905,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       // Determine direction using visible anchor indices
       final media = MediaQuery.of(context);
       final double listTop = kToolbarHeight + media.padding.top;
-      final double listBottom = media.size.height - media.padding.bottom - _inputBarHeight - 8;
+      final double listBottom =
+          media.size.height - media.padding.bottom - _inputBarHeight - 8;
       int? firstVisibleIdx;
       int? lastVisibleIdx;
       for (int i = 0; i < messages.length; i++) {
@@ -3299,16 +3961,20 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       if (messages.isEmpty) return;
       // Build an id->index map for quick lookup
       final Map<String, int> idxById = <String, int>{};
-      for (int i = 0; i < messages.length; i++) { idxById[messages[i].id] = i; }
+      for (int i = 0; i < messages.length; i++) {
+        idxById[messages[i].id] = i;
+      }
 
       // Determine anchor index: prefer last jumped user; otherwise bottom-most visible item
       int? anchor;
-      if (_lastJumpUserMessageId != null && idxById.containsKey(_lastJumpUserMessageId)) {
+      if (_lastJumpUserMessageId != null &&
+          idxById.containsKey(_lastJumpUserMessageId)) {
         anchor = idxById[_lastJumpUserMessageId!];
       } else {
         final media = MediaQuery.of(context);
         final double listTop = kToolbarHeight + media.padding.top;
-        final double listBottom = media.size.height - media.padding.bottom - _inputBarHeight - 8;
+        final double listBottom =
+            media.size.height - media.padding.bottom - _inputBarHeight - 8;
         int? firstVisibleIdx;
         int? lastVisibleIdx;
         for (int i = 0; i < messages.length; i++) {
@@ -3330,7 +3996,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       // Search backward for previous user message from the anchor index
       int target = -1;
       for (int i = (anchor ?? 0) - 1; i >= 0; i--) {
-        if (messages[i].role == 'user') { target = i; break; }
+        if (messages[i].role == 'user') {
+          target = i;
+          break;
+        }
       }
       if (target < 0) {
         // No earlier user message; jump to top instantly
@@ -3396,12 +4065,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     final assistant = context.read<AssistantProvider>().currentAssistant;
 
     // Check if translation model is set, fallback to assistant's model, then to global default
-    final translateProvider = settings.translateModelProvider
-        ?? assistant?.chatModelProvider
-        ?? settings.currentModelProvider;
-    final translateModelId = settings.translateModelId
-        ?? assistant?.chatModelId
-        ?? settings.currentModelId;
+    final translateProvider =
+        settings.translateModelProvider ??
+        assistant?.chatModelProvider ??
+        settings.currentModelProvider;
+    final translateModelId =
+        settings.translateModelId ??
+        assistant?.chatModelId ??
+        settings.currentModelId;
 
     if (translateProvider == null || translateModelId == null) {
       showAppSnackBar(
@@ -3416,7 +4087,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     String textToTranslate = message.content;
 
     // Set loading state and initialize translation data
-    final loadingMessage = message.copyWith(translation: l10n.homePageTranslating);
+    final loadingMessage = message.copyWith(
+      translation: l10n.homePageTranslating,
+    );
     setState(() {
       final index = _messages.indexWhere((m) => m.id == message.id);
       if (index != -1) {
@@ -3439,7 +4112,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         config: provider,
         modelId: translateModelId,
         messages: [
-          {'role': 'user', 'content': prompt}
+          {'role': 'user', 'content': prompt},
         ],
       );
 
@@ -3449,7 +4122,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         buffer.write(chunk.content);
 
         // Update translation in real-time
-        final updatingMessage = message.copyWith(translation: buffer.toString());
+        final updatingMessage = message.copyWith(
+          translation: buffer.toString(),
+        );
         setState(() {
           final index = _messages.indexWhere((m) => m.id == message.id);
           if (index != -1) {
@@ -3459,8 +4134,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       }
 
       // Save final translation
-      await _chatService.updateMessage(message.id, translation: buffer.toString());
-
+      await _chatService.updateMessage(
+        message.id,
+        translation: buffer.toString(),
+      );
     } catch (e) {
       // Clear translation on error (empty to hide immediately)
       final errorMessage = message.copyWith(translation: '');
@@ -3494,7 +4171,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       final cs = Theme.of(context).colorScheme;
       final settings = context.watch<SettingsProvider>();
       final assistant = context.watch<AssistantProvider>().currentAssistant;
-      final providerKey = assistant?.chatModelProvider ?? settings.currentModelProvider;
+      final providerKey =
+          assistant?.chatModelProvider ?? settings.currentModelProvider;
       final modelId = assistant?.chatModelId ?? settings.currentModelId;
       String? providerName;
       String? modelDisplay;
@@ -3502,9 +4180,18 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         final cfg = settings.getProviderConfig(providerKey);
         providerName = cfg.name.isNotEmpty ? cfg.name : providerKey;
         final ov = cfg.modelOverrides[modelId] as Map?;
-        modelDisplay = (ov != null && (ov['name'] as String?)?.isNotEmpty == true) ? (ov['name'] as String) : modelId;
+        modelDisplay =
+            (ov != null && (ov['name'] as String?)?.isNotEmpty == true)
+            ? (ov['name'] as String)
+            : modelId;
       }
-      return _buildTabletLayout(context, title: title, providerName: providerName, modelDisplay: modelDisplay, cs: cs);
+      return _buildTabletLayout(
+        context,
+        title: title,
+        providerName: providerName,
+        modelDisplay: modelDisplay,
+        cs: cs,
+      );
     }
 
     final title = ((_currentConversation?.title ?? '').trim().isNotEmpty)
@@ -3513,9 +4200,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     final cs = Theme.of(context).colorScheme;
     final settings = context.watch<SettingsProvider>();
     final assistant = context.watch<AssistantProvider>().currentAssistant;
-    
+
     // Use assistant's model if set, otherwise fall back to global default
-    final providerKey = assistant?.chatModelProvider ?? settings.currentModelProvider;
+    final providerKey =
+        assistant?.chatModelProvider ?? settings.currentModelProvider;
     final modelId = assistant?.chatModelId ?? settings.currentModelId;
     String? providerName;
     String? modelDisplay;
@@ -3523,7 +4211,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       final cfg = settings.getProviderConfig(providerKey);
       providerName = cfg.name.isNotEmpty ? cfg.name : providerKey;
       final ov = cfg.modelOverrides[modelId] as Map?;
-      modelDisplay = (ov != null && (ov['name'] as String?)?.isNotEmpty == true) ? (ov['name'] as String) : modelId;
+      modelDisplay = (ov != null && (ov['name'] as String?)?.isNotEmpty == true)
+          ? (ov['name'] as String)
+          : modelId;
     }
 
     // Chats are seeded via ChatProvider in main.dart
@@ -3581,1034 +4271,26 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         resizeToAvoidBottomInset: true,
         extendBodyBehindAppBar: true,
         // backgroundColor: Theme.of(context).colorScheme.background,
-      appBar: AppBar(
-        // centerTitle: true,
-        systemOverlayStyle: (Theme.of(context).brightness == Brightness.dark)
-            ? const SystemUiOverlayStyle(
-          statusBarColor: Colors.transparent,
-          statusBarIconBrightness: Brightness.light, // Android icons
-          statusBarBrightness: Brightness.dark, // iOS text
-        )
-            : const SystemUiOverlayStyle(
-          statusBarColor: Colors.transparent,
-          statusBarIconBrightness: Brightness.dark,
-          statusBarBrightness: Brightness.light,
-        ),
-        backgroundColor: Colors.transparent,
-        surfaceTintColor: Colors.transparent,
-        elevation: 0,
-        scrolledUnderElevation: 0,
-        leading: Builder(builder: (context) {
-          return IosIconButton(
-            size: 20,
-            padding: const EdgeInsets.all(8),
-            minSize: 40,
-            builder: (color) => SvgPicture.asset(
-              'assets/icons/list.svg',
-              width: 14,
-              height: 14,
-              colorFilter: ColorFilter.mode(color, BlendMode.srcIn),
-            ),
-            onTap: () {
-              // Always dismiss keyboard when toggling the sidebar
-              _dismissKeyboard();
-              _drawerController.toggle();
-            },
-          );
-        }),
-        titleSpacing: 2,
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          // crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            AnimatedTextSwap(
-              text: title,
-              // Desktop稍微收紧标题字号
-              style: TextStyle(
-                fontSize: (defaultTargetPlatform == TargetPlatform.macOS ||
-                        defaultTargetPlatform == TargetPlatform.windows ||
-                        defaultTargetPlatform == TargetPlatform.linux)
-                    ? 14
-                    : 16,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-            if (providerName != null && modelDisplay != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 2),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(6),
-                  onTap: () => showModelSelectSheet(context),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 0),
-                    child: AnimatedTextSwap(
-                      text: '$modelDisplay ($providerName)',
-                      style: TextStyle(fontSize: 11, color: cs.onSurface.withOpacity(0.6), fontWeight: FontWeight.w500),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
+        appBar: AppBar(
+          // centerTitle: true,
+          systemOverlayStyle: (Theme.of(context).brightness == Brightness.dark)
+              ? const SystemUiOverlayStyle(
+                  statusBarColor: Colors.transparent,
+                  statusBarIconBrightness: Brightness.light, // Android icons
+                  statusBarBrightness: Brightness.dark, // iOS text
+                )
+              : const SystemUiOverlayStyle(
+                  statusBarColor: Colors.transparent,
+                  statusBarIconBrightness: Brightness.dark,
+                  statusBarBrightness: Brightness.light,
                 ),
-              ),
-          ],
-        ),
-        actions: [
-          // Mini map button (to the left of new conversation)
-          IosIconButton(
-            size: 20,
-            minSize: 44,
-            onTap: () async {
-              final collapsed = _collapseVersions(_messages);
-              String? selectedId;
-              try {
-                if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
-                  selectedId = await showDesktopMiniMapPopover(context, anchorKey: _inputBarKey, messages: collapsed);
-                } else {
-                  selectedId = await showMiniMapSheet(context, collapsed);
-                }
-              } catch (_) {
-                selectedId = await showMiniMapSheet(context, collapsed);
-              }
-              if (!mounted) return;
-              if (selectedId != null && selectedId.isNotEmpty) {
-                await _scrollToMessageId(selectedId);
-              }
-            },
-            semanticLabel: AppLocalizations.of(context)!.miniMapTooltip,
-            icon: Lucide.Map,
-          ),
-          // const SizedBox(width: 4),
-          IosIconButton(
-            size: 22,
-            minSize: 44,
-            onTap: () async {
-              await _createNewConversation();
-              if (mounted) {
-                // Close drawer if open and scroll to bottom (fresh convo)
-                _forceScrollToBottomSoon();
-              }
-            },
-            icon: Lucide.MessageCirclePlus,
-          ),
-          const SizedBox(width: 4),
-          // Move the right spacer between mini map and new-topic per request
-        ],
-      ),
-      body: _wrapWithDropTarget(Stack(
-          children: [
-            // Assistant-specific chat background + gradient overlay to improve readability
-            Builder(
-              builder: (context) {
-              final bg = context.watch<AssistantProvider>().currentAssistant?.background;
-              final maskStrength = context.watch<SettingsProvider>().chatBackgroundMaskStrength;
-            if (bg == null || bg.trim().isEmpty) return const SizedBox.shrink();
-            ImageProvider provider;
-            if (bg.startsWith('http')) {
-              provider = NetworkImage(bg);
-            } else {
-              final localPath = SandboxPathResolver.fix(bg);
-              final file = File(localPath);
-              if (!file.existsSync()) return const SizedBox.shrink();
-              provider = FileImage(file);
-            }
-            return Positioned.fill(
-              child: Stack(
-                children: [
-                  // Background image
-                  Positioned.fill(
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        image: DecorationImage(
-                          image: provider,
-                          fit: BoxFit.cover,
-                          colorFilter: ColorFilter.mode(Colors.black.withOpacity(0.04), BlendMode.srcATop),
-                        ),
-                      ),
-                    ),
-                  ),
-                  // Vertical gradient overlay (top ~20% -> bottom ~50%) using theme background color
-                  Positioned.fill(
-                    child: IgnorePointer(
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topCenter,
-                            end: Alignment.bottomCenter,
-                            colors: () {
-                              final top = (0.20 * maskStrength).clamp(0.0, 1.0);
-                              final bottom = (0.50 * maskStrength).clamp(0.0, 1.0);
-                              return [
-                                cs.background.withOpacity(top),
-                                cs.background.withOpacity(bottom),
-                              ];
-                            }(),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            );
-          }),
-          // Main column content
-          Padding(
-            padding: EdgeInsets.only(top: kToolbarHeight + MediaQuery.of(context).padding.top),
-            child: Column(
-            children: [
-              // Chat messages list (animate when switching topic)
-              Expanded(
-                child: Builder(
-                    builder: (context) {
-                      final __content = KeyedSubtree(
-                        key: ValueKey<String>(_currentConversation?.id ?? 'none'),
-                        child: (() {
-                      // Stable snapshot for this build (collapse versions)
-                      final messages = _collapseVersions(_messages);
-                      final Map<String, List<ChatMessage>> byGroup = <String, List<ChatMessage>>{};
-                      for (final m in _messages) {
-                        final gid = (m.groupId ?? m.id);
-                        byGroup.putIfAbsent(gid, () => <ChatMessage>[]).add(m);
-                      }
-                      // Map persisted truncateIndex (raw message count) to collapsed index
-                      final int truncRaw = _currentConversation?.truncateIndex ?? -1;
-                      int truncCollapsed = -1;
-                      if (truncRaw > 0) {
-                        final seen = <String>{};
-                        final int limit = truncRaw < _messages.length ? truncRaw : _messages.length;
-                        int count = 0;
-                        for (int i = 0; i < limit; i++) {
-                          final gid0 = (_messages[i].groupId ?? _messages[i].id);
-                          if (seen.add(gid0)) count++;
-                        }
-                        truncCollapsed = count - 1;
-                      }
-                      final list = ListView.builder(
-                        controller: _scrollController,
-                        padding: const EdgeInsets.only(bottom: 16, top: 8),
-                        itemCount: messages.length,
-                        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-                        itemBuilder: (context, index) {
-                          if (index < 0 || index >= messages.length) {
-                            return const SizedBox.shrink();
-                          }
-                          final message = messages[index];
-                          final r = _reasoning[message.id];
-                          final t = _translations[message.id];
-                          final chatScale = context.watch<SettingsProvider>().chatFontScale;
-                          final assistant = context.watch<AssistantProvider>().currentAssistant;
-                          final useAssist = assistant?.useAssistantAvatar == true;
-                          final l10n = AppLocalizations.of(context)!;
-                          final showDivider = truncCollapsed >= 0 && index == truncCollapsed;
-                          final cs = Theme.of(context).colorScheme;
-                          final label = l10n.homePageClearContext;
-                          final divider = Row(
-                            children: [
-                              Expanded(child: Divider(color: cs.outlineVariant.withOpacity(0.6), height: 1, thickness: 1)),
-                              Padding(
-                                padding: const EdgeInsets.symmetric(horizontal: 10),
-                                child: Text(label, style: TextStyle(fontSize: 12, color: cs.onSurface.withOpacity(0.6))),
-                              ),
-                              Expanded(child: Divider(color: cs.outlineVariant.withOpacity(0.6), height: 1, thickness: 1)),
-                            ],
-                          );
-                          final gid = (message.groupId ?? message.id);
-                          final vers = (byGroup[gid] ?? const <ChatMessage>[]).toList()..sort((a,b)=>a.version.compareTo(b.version));
-                          final selectedIdx = _versionSelections[gid] ?? (vers.isNotEmpty ? vers.length - 1 : 0);
-                          final total = vers.length;
-                          final showMsgNav = context.watch<SettingsProvider>().showMessageNavButtons;
-                          final effectiveTotal = showMsgNav ? total : 1;
-                          final effectiveIndex = showMsgNav ? selectedIdx : 0;
-
-                          return Column(
-                            key: _keyForMessage(message.id),
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  if (_selecting && (message.role == 'user' || message.role == 'assistant'))
-                                    Padding(
-                                      padding: const EdgeInsets.only(left: 10, right: 6),
-                                      child: IosCheckbox(
-                                        value: _selectedItems.contains(message.id),
-                                        onChanged: (v) {
-                                          setState(() {
-                                            if (v) {
-                                              _selectedItems.add(message.id);
-                                            } else {
-                                              _selectedItems.remove(message.id);
-                                            }
-                                          });
-                                        },
-                                      ),
-                                    ),
-                                  Expanded(
-                                    child: MediaQuery(
-                                      data: MediaQuery.of(context).copyWith(
-                                        textScaleFactor: MediaQuery.of(context).textScaleFactor * chatScale,
-                                      ),
-                                      child: ChatMessageWidget(
-                                  message: message,
-                                  versionIndex: effectiveIndex,
-                                  versionCount: effectiveTotal,
-                                  onPrevVersion: (showMsgNav && selectedIdx > 0) ? () async {
-                                    final next = selectedIdx - 1;
-                                    _versionSelections[gid] = next;
-                                    await _chatService.setSelectedVersion(_currentConversation!.id, gid, next);
-                                    if (mounted) setState(() {});
-                                  } : null,
-                                  onNextVersion: (showMsgNav && selectedIdx < total - 1) ? () async {
-                                    final next = selectedIdx + 1;
-                                    _versionSelections[gid] = next;
-                                    await _chatService.setSelectedVersion(_currentConversation!.id, gid, next);
-                                    if (mounted) setState(() {});
-                                  } : null,
-                                  modelIcon: (!useAssist && message.role == 'assistant' && message.providerId != null && message.modelId != null)
-                                      ? _CurrentModelIcon(providerKey: message.providerId, modelId: message.modelId, size: 30)
-                                      : null,
-                                  showModelIcon: useAssist ? false : context.watch<SettingsProvider>().showModelIcon,
-                                  useAssistantAvatar: useAssist && message.role == 'assistant',
-                                  assistantName: useAssist ? (assistant?.name ?? 'Assistant') : null,
-                                  assistantAvatar: useAssist ? (assistant?.avatar ?? '') : null,
-                                  showUserAvatar: context.watch<SettingsProvider>().showUserAvatar,
-                                  showTokenStats: context.watch<SettingsProvider>().showTokenStats,
-                                  reasoningText: (message.role == 'assistant') ? (r?.text ?? '') : null,
-                                  reasoningExpanded: (message.role == 'assistant') ? (r?.expanded ?? false) : false,
-                                  reasoningLoading: (message.role == 'assistant') ? (r?.finishedAt == null && (r?.text.isNotEmpty == true)) : false,
-                                  reasoningStartAt: (message.role == 'assistant') ? r?.startAt : null,
-                                  reasoningFinishedAt: (message.role == 'assistant') ? r?.finishedAt : null,
-                                  onToggleReasoning: (message.role == 'assistant' && r != null)
-                                      ? () {
-                                          setState(() {
-                                            r.expanded = !r.expanded;
-                                          });
-                                        }
-                                      : null,
-                                  translationExpanded: t?.expanded ?? true,
-                                  onToggleTranslation: (message.translation != null && message.translation!.isNotEmpty && t != null)
-                                      ? () {
-                                          setState(() {
-                                            t.expanded = !t.expanded;
-                                          });
-                                        }
-                                      : null,
-                                  onRegenerate: message.role == 'assistant' ? () { _regenerateAtMessage(message); } : null,
-                                  onResend: message.role == 'user' ? () { _regenerateAtMessage(message); } : null,
-                                  onTranslate: message.role == 'assistant'
-                                      ? () {
-                                          _translateMessage(message);
-                                        }
-                                      : null,
-                                  onSpeak: message.role == 'assistant'
-                                      ? () async {
-                                          final isDesktop = defaultTargetPlatform == TargetPlatform.macOS ||
-                                              defaultTargetPlatform == TargetPlatform.windows ||
-                                              defaultTargetPlatform == TargetPlatform.linux;
-                                          if (isDesktop) {
-                                            final sp = context.read<SettingsProvider>();
-                                            final hasNetworkTts = sp.ttsServiceSelected >= 0 && sp.ttsServices.isNotEmpty;
-                                            if (!hasNetworkTts) {
-                                              showAppSnackBar(
-                                                context,
-                                                message: AppLocalizations.of(context)!.desktopTtsPleaseAddProvider,
-                                                type: NotificationType.warning,
-                                              );
-                                              return;
-                                            }
-                                          }
-                                          final tts = context.read<TtsProvider>();
-                                          if (!tts.isSpeaking) {
-                                            await tts.speak(message.content);
-                                          } else {
-                                            await tts.stop();
-                                          }
-                                        }
-                                      : null,
-                                  onEdit: message.role == 'user' ? () async {
-                                    final isDesktop = defaultTargetPlatform == TargetPlatform.macOS ||
-                                        defaultTargetPlatform == TargetPlatform.windows ||
-                                        defaultTargetPlatform == TargetPlatform.linux;
-                                    final edited = isDesktop
-                                        ? await showMessageEditDesktopDialog(context, message: message)
-                                        : await showMessageEditSheet(context, message: message);
-                                    if (edited != null) {
-                                      final newMsg = await _chatService.appendMessageVersion(messageId: message.id, content: edited);
-                                      if (!mounted) return;
-                                      setState(() {
-                                        if (newMsg != null) {
-                                          _messages.add(newMsg);
-                                          final gid2 = (newMsg.groupId ?? newMsg.id);
-                                          _versionSelections[gid2] = newMsg.version;
-                                        }
-                                      });
-                                      try {
-                                        if (newMsg != null && _currentConversation != null) {
-                                          final gid2 = (newMsg.groupId ?? newMsg.id);
-                                          await _chatService.setSelectedVersion(_currentConversation!.id, gid2, newMsg.version);
-                                        }
-                                      } catch (_) {}
-                                    }
-                                  } : null,
-                                  onDelete: message.role == 'user' ? () async {
-                                    final l10n = AppLocalizations.of(context)!;
-                                    final confirm = await showDialog<bool>(
-                                      context: context,
-                                      builder: (ctx) => AlertDialog(
-                                        title: Text(l10n.homePageDeleteMessage),
-                                        content: Text(l10n.homePageDeleteMessageConfirm),
-                                        actions: [
-                                          TextButton(
-                                            onPressed: () => Navigator.of(ctx).pop(false),
-                                            child: Text(l10n.homePageCancel),
-                                          ),
-                                          TextButton(
-                                            onPressed: () => Navigator.of(ctx).pop(true),
-                                            child: Text(l10n.homePageDelete, style: const TextStyle(color: Colors.red)),
-                                          ),
-                                        ],
-                                      ),
-                                    );
-                                    if (confirm == true) {
-                                      final id = message.id;
-                                      setState(() {
-                                        _messages.removeWhere((m) => m.id == id);
-                                        _reasoning.remove(id);
-                                        _translations.remove(id);
-                                        _toolParts.remove(id);
-                                        _reasoningSegments.remove(id);
-                                      });
-                                      await _chatService.deleteMessage(id);
-                                    }
-                                  } : null,
-                              onMore: () async {
-                                final action = await showMessageMoreSheet(context, message);
-                                if (!mounted) return;
-                                if (action == MessageMoreAction.delete) {
-                                  final l10n = AppLocalizations.of(context)!;
-                                  final confirm = await showDialog<bool>(
-                                    context: context,
-                                    builder: (ctx) => AlertDialog(
-                                      title: Text(l10n.homePageDeleteMessage),
-                                      content: Text(l10n.homePageDeleteMessageConfirm),
-                                      actions: [
-                                        TextButton(
-                                          onPressed: () => Navigator.of(ctx).pop(false),
-                                          child: Text(l10n.homePageCancel),
-                                        ),
-                                        TextButton(
-                                          onPressed: () => Navigator.of(ctx).pop(true),
-                                          child: Text(l10n.homePageDelete, style: const TextStyle(color: Colors.red)),
-                                        ),
-                                      ],
-                                    ),
-                                  );
-                                  if (confirm == true) {
-                                    final id = message.id;
-                                    setState(() {
-                                      _messages.removeWhere((m) => m.id == id);
-                                      _reasoning.remove(id);
-                                      _translations.remove(id);
-                                      _toolParts.remove(id);
-                                      _reasoningSegments.remove(id);
-                                    });
-                                    await _chatService.deleteMessage(id);
-                                  }
-                                } else if (action == MessageMoreAction.edit) {
-                                  final isDesktop = defaultTargetPlatform == TargetPlatform.macOS ||
-                                      defaultTargetPlatform == TargetPlatform.windows ||
-                                      defaultTargetPlatform == TargetPlatform.linux;
-                                  final edited = isDesktop
-                                      ? await showMessageEditDesktopDialog(context, message: message)
-                                      : await showMessageEditSheet(context, message: message);
-                                  if (edited != null) {
-                                    final newMsg = await _chatService.appendMessageVersion(messageId: message.id, content: edited);
-                                    if (!mounted) return;
-                                    setState(() {
-                                      if (newMsg != null) {
-                                        _messages.add(newMsg);
-                                        final gid = (newMsg.groupId ?? newMsg.id);
-                                        _versionSelections[gid] = newMsg.version;
-                                      }
-                                    });
-                                    try {
-                                      if (newMsg != null && _currentConversation != null) {
-                                        final gid = (newMsg.groupId ?? newMsg.id);
-                                        await _chatService.setSelectedVersion(_currentConversation!.id, gid, newMsg.version);
-                                      }
-                                    } catch (_) {}
-                                  }
-                                } else if (action == MessageMoreAction.fork) {
-                                  // Determine included groups up to the message's group (inclusive)
-                                  final Map<String, int> groupFirstIndex = <String, int>{};
-                                  final List<String> groupOrder = <String>[];
-                                  for (int i = 0; i < _messages.length; i++) {
-                                    final gid0 = (_messages[i].groupId ?? _messages[i].id);
-                                    if (!groupFirstIndex.containsKey(gid0)) {
-                                      groupFirstIndex[gid0] = i;
-                                      groupOrder.add(gid0);
-                                    }
-                                  }
-                                  final targetGroup = (message.groupId ?? message.id);
-                                  final targetOrderIndex = groupOrder.indexOf(targetGroup);
-                                  if (targetOrderIndex >= 0) {
-                                    final includeGroups = groupOrder.take(targetOrderIndex + 1).toSet();
-                                    final selected = [
-                                      for (final m in _messages)
-                                        if (includeGroups.contains(m.groupId ?? m.id)) m
-                                    ];
-                                    // Filter version selections to included groups
-                                    final sel = <String, int>{};
-                                    for (final gid in includeGroups) {
-                                      final v = _versionSelections[gid];
-                                      if (v != null) sel[gid] = v;
-                                    }
-                                    final newConvo = await _chatService.forkConversation(
-                                      title: _titleForLocale(context),
-                                      assistantId: _currentConversation?.assistantId,
-                                      sourceMessages: selected,
-                                      versionSelections: sel,
-                                    );
-                                    // Switch to the new conversation; skip fade on desktop for instant switch
-                                    if (!mounted) return;
-                                    if (!_isDesktopPlatform) {
-                                      await _convoFadeController.reverse();
-                                    }
-                                    _chatService.setCurrentConversation(newConvo.id);
-                                    final msgs = _chatService.getMessages(newConvo.id);
-                                    if (!mounted) return;
-                                    setState(() {
-                                      _currentConversation = newConvo;
-                                      _messages = List.of(msgs);
-                                      _loadVersionSelections();
-                                      _restoreMessageUiState();
-                                    });
-                                    try { await WidgetsBinding.instance.endOfFrame; } catch (_) {}
-                                    _scrollToBottom();
-                                    if (!_isDesktopPlatform) {
-                                      await _convoFadeController.forward();
-                                    }
-                                  }
-                                } else if (action == MessageMoreAction.share) {
-                                  // Enter selection mode and preselect up to this message (inclusive)
-                                  setState(() {
-                                    _selecting = true;
-                                    _selectedItems.clear();
-                                    for (int i = 0; i <= index && i < messages.length; i++) {
-                                      final m = messages[i];
-                                      final enabled0 = (m.role == 'user' || m.role == 'assistant');
-                                      if (enabled0) _selectedItems.add(m.id);
-                                    }
-                                  });
-                                }
-                              },
-                                  toolParts: message.role == 'assistant' ? _toolParts[message.id] : null,
-                                  reasoningSegments: message.role == 'assistant'
-                                      ? (() {
-                                          final segments = _reasoningSegments[message.id];
-                                          if (segments == null || segments.isEmpty) return null;
-                                          return segments
-                                              .map((s) => ReasoningSegment(
-                                                    text: s.text,
-                                                    expanded: s.expanded,
-                                                    loading: s.finishedAt == null && s.text.isNotEmpty,
-                                                    startAt: s.startAt,
-                                                    finishedAt: s.finishedAt,
-                                                    onToggle: () {
-                                                      setState(() {
-                                                        s.expanded = !s.expanded;
-                                                      });
-                                                    },
-                                                    toolStartIndex: s.toolStartIndex,
-                                                  ))
-                                              .toList();
-                                        })()
-                                      : null,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              if (showDivider)
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(vertical: 10, horizontal: AppSpacing.md),
-                                  child: divider,
-                                ),
-                            ],
-                          );
-                        },
-                      );
-                      return list;
-                        })(),
-                      );
-                      final isAndroid = Theme.of(context).platform == TargetPlatform.android;
-                      Widget w = __content;
-                      if (!isAndroid) {
-                        w = w
-                            .animate(key: ValueKey('mob_body_'+(_currentConversation?.id ?? 'none')))
-                            .fadeIn(duration: 200.ms, curve: Curves.easeOutCubic);
-                            // .slideY(begin: 0.02, end: 0, duration: 240.ms, curve: Curves.easeOutCubic);
-                        w = FadeTransition(opacity: _convoFade, child: w);
-                      }
-                      return w;
-                    },
-                  ),
-              ),
-              // Input bar
-              NotificationListener<SizeChangedLayoutNotification>(
-                onNotification: (n) {
-                  WidgetsBinding.instance.addPostFrameCallback((_) => _measureInputBar());
-                  return false;
-                },
-                child: SizeChangedLayoutNotifier(
-                  child: Builder(
-                    builder: (context) {
-                      // Enforce model capabilities: disable MCP selection if model doesn't support tools
-                      final settings = context.watch<SettingsProvider>();
-                      final ap = context.watch<AssistantProvider>();
-                      final a = ap.currentAssistant;
-                      // Use assistant's model if set, otherwise fall back to global default
-                      final pk = a?.chatModelProvider ?? settings.currentModelProvider;
-                      final mid = a?.chatModelId ?? settings.currentModelId;
-                      if (pk != null && mid != null) {
-                        final supportsTools = _isToolModel(pk, mid);
-                        if (!supportsTools && (a?.mcpServerIds.isNotEmpty ?? false)) {
-                          WidgetsBinding.instance.addPostFrameCallback((_) {
-                            final aa = ap.currentAssistant;
-                            if (aa != null && aa.mcpServerIds.isNotEmpty) {
-                              ap.updateAssistant(aa.copyWith(mcpServerIds: const <String>[]));
-                            }
-                          });
-                        }
-                        final supportsReasoning = _isReasoningModel(pk, mid);
-                        if (!supportsReasoning && a != null) {
-                          final enabledNow = _isReasoningEnabled(a.thinkingBudget ?? settings.thinkingBudget);
-                          if (enabledNow) {
-                            WidgetsBinding.instance.addPostFrameCallback((_) async {
-                              final aa = ap.currentAssistant;
-                              if (aa != null) {
-                                await ap.updateAssistant(aa.copyWith(thinkingBudget: 0));
-                              }
-                            });
-                          }
-                        }
-                      }
-                      // Compute whether built-in built-in search (Gemini official or Claude) is active to highlight the search button
-                      final currentProvider = a?.chatModelProvider ?? settings.currentModelProvider;
-                      final currentModelId = a?.chatModelId ?? settings.currentModelId;
-                      final cfg = (currentProvider != null)
-                          ? settings.getProviderConfig(currentProvider)
-                          : null;
-                      bool builtinSearchActive = false;
-                      if (cfg != null && currentModelId != null) {
-                        final mid2 = currentModelId;
-                        final isGeminiOfficial = cfg.providerType == ProviderKind.google && (cfg.vertexAI != true);
-                        final isClaude = cfg.providerType == ProviderKind.claude;
-                        final isOpenAIResponses = cfg.providerType == ProviderKind.openai && (cfg.useResponseApi == true);
-                        if (isGeminiOfficial || isClaude || isOpenAIResponses) {
-                          final ov = cfg.modelOverrides[mid2] as Map?;
-                          final list = (ov?['builtInTools'] as List?) ?? const <dynamic>[];
-                          builtinSearchActive = list.map((e) => e.toString().toLowerCase()).contains('search');
-                        }
-                      }
-                      return ChatInputBar(
-                        key: _inputBarKey,
-                        onMore: _toggleTools,
-                        // Highlight when app-level search enabled OR model built-in search enabled
-                        searchEnabled: context.watch<SettingsProvider>().searchEnabled || builtinSearchActive,
-                        onToggleSearch: (enabled) {
-                          context.read<SettingsProvider>().setSearchEnabled(enabled);
-                        },
-                        onSelectModel: () => showModelSelectSheet(context),
-                        onLongPressSelectModel: () {
-                          Navigator.of(context).push(
-                            MaterialPageRoute(builder: (_) => const ProvidersPage()),
-                          );
-                        },
-                        onOpenMcp: () {
-                          final a = context.read<AssistantProvider>().currentAssistant;
-                          if (a != null) {
-                            try {
-                              if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
-                                showDesktopMcpServersPopover(context, anchorKey: _inputBarKey, assistantId: a.id);
-                              } else {
-                                showAssistantMcpSheet(context, assistantId: a.id);
-                              }
-                            } catch (_) {
-                              showAssistantMcpSheet(context, assistantId: a.id);
-                            }
-                          }
-                        },
-                        onLongPressMcp: () {
-                          Navigator.of(context).push(
-                            MaterialPageRoute(builder: (_) => const McpPage()),
-                          );
-                        },
-                        onStop: _cancelStreaming,
-                        modelIcon: (settings.showModelIcon && ((a?.chatModelProvider ?? settings.currentModelProvider) != null) && ((a?.chatModelId ?? settings.currentModelId) != null))
-                            ? _CurrentModelIcon(
-                                providerKey: a?.chatModelProvider ?? settings.currentModelProvider,
-                                modelId: a?.chatModelId ?? settings.currentModelId,
-                                size: 40,
-                                withBackground: true,
-                                backgroundColor: Colors.transparent,
-                              )
-                            : null,
-                        focusNode: _inputFocus,
-                        controller: _inputController,
-                        mediaController: _mediaController,
-                        onConfigureReasoning: () async {
-                          final assistant = context.read<AssistantProvider>().currentAssistant;
-                          if (assistant != null) {
-                            if (assistant.thinkingBudget != null) {
-                              context.read<SettingsProvider>().setThinkingBudget(assistant.thinkingBudget);
-                            }
-                            await _openReasoningSettings();
-                            final chosen = context.read<SettingsProvider>().thinkingBudget;
-                            await context.read<AssistantProvider>().updateAssistant(
-                              assistant.copyWith(thinkingBudget: chosen),
-                            );
-                          }
-                        },
-                        reasoningActive: _isReasoningEnabled((context.watch<AssistantProvider>().currentAssistant?.thinkingBudget) ?? settings.thinkingBudget),
-                        supportsReasoning: (pk != null && mid != null)
-                            ? _isReasoningModel(pk, mid)
-                            : false,
-                        onOpenSearch: _openSearchSettings,
-                        onSend: (text) {
-                          _sendMessage(text);
-                          _inputController.clear();
-                          // Keep focus on desktop; only dismiss on mobile to hide soft keyboard
-                          if (Platform.isAndroid || Platform.isIOS) {
-                            _dismissKeyboard();
-                          } else {
-                            _inputFocus.requestFocus();
-                          }
-                        },
-                        loading: _isCurrentConversationLoading,
-                        showMcpButton: (() {
-                          final pk2 = a?.chatModelProvider ?? settings.currentModelProvider;
-                          final mid3 = a?.chatModelId ?? settings.currentModelId;
-                          if (pk2 == null || mid3 == null) return false;
-                          return _isToolModel(pk2, mid3) && context.watch<McpProvider>().servers.isNotEmpty;
-                        })(),
-                        mcpActive: (() {
-                          final a = context.watch<AssistantProvider>().currentAssistant;
-                          final connected = context.watch<McpProvider>().connectedServers;
-                          final selected = a?.mcpServerIds ?? const <String>[];
-                          if (selected.isEmpty || connected.isEmpty) return false;
-                          return connected.any((s) => selected.contains(s.id));
-                        })(),
-                        showQuickPhraseButton: (() {
-                          final assistant = context.watch<AssistantProvider>().currentAssistant;
-                          final quickPhraseProvider = context.watch<QuickPhraseProvider>();
-                          final globalCount = quickPhraseProvider.globalPhrases.length;
-                          final assistantCount = assistant != null
-                              ? quickPhraseProvider.getForAssistant(assistant.id).length
-                              : 0;
-                          return (globalCount + assistantCount) > 0;
-                        })(),
-                        onQuickPhrase: _showQuickPhraseMenu,
-                        onLongPressQuickPhrase: () {
-                          Navigator.of(context).push(
-                            MaterialPageRoute(builder: (_) => const QuickPhrasesPage()),
-                          );
-                        },
-                      );
-                    },
-                  ),
-                ),
-              ),
-            ],
-            ),
-          ),
-
-          // // iOS-style blur/fade effect above input area
-          // Positioned(
-          //   left: 0,
-          //   right: 0,
-          //   bottom: _inputBarHeight,
-          //   child: IgnorePointer(
-          //     child: Container(
-          //       height: 20,
-          //       decoration: BoxDecoration(
-          //         gradient: LinearGradient(
-          //           begin: Alignment.topCenter,
-          //           end: Alignment.bottomCenter,
-          //           colors: [
-          //             Theme.of(context).colorScheme.background.withOpacity(0.0),
-          //             Theme.of(context).colorScheme.background.withOpacity(0.8),
-          //             Theme.of(context).colorScheme.background.withOpacity(1.0),
-          //           ],
-          //           stops: const [0.0, 0.6, 1.0],
-          //         ),
-          //       ),
-          //     ),
-          //   ),
-          // ),
-
-          // Inline tools sheet removed; replaced by modal bottom sheet
-
-          // Selection toolbar overlay (above input bar) with iOS glass capsule + animations
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: SafeArea(
-              top: false,
-              child: Padding(
-                // Move higher: 72 + 12 + 38
-                padding: const EdgeInsets.only(bottom: 122),
-                child: _AnimatedSelectionBar(
-                  visible: _selecting,
-                  child: _SelectionToolbar(
-                    onCancel: () {
-                      setState(() {
-                        _selecting = false;
-                        _selectedItems.clear();
-                      });
-                    },
-                    onConfirm: () async {
-                      final convo = _currentConversation;
-                      if (convo == null) return;
-                      final collapsed = _collapseVersions(_messages);
-                      final selected = <ChatMessage>[];
-                      for (final m in collapsed) {
-                        if (_selectedItems.contains(m.id)) selected.add(m);
-                      }
-                      if (selected.isEmpty) {
-                        final l10n = AppLocalizations.of(context)!;
-                        showAppSnackBar(
-                          context,
-                          message: l10n.homePageSelectMessagesToShare,
-                          type: NotificationType.info,
-                        );
-                        return;
-                      }
-                      setState(() { _selecting = false; });
-                      await showChatExportSheet(context, conversation: convo, selectedMessages: selected);
-                      if (mounted) setState(() { _selectedItems.clear(); });
-                    },
-                  ),
-                ),
-              ),
-            ),
-          ),
-
-          // Scroll-to-bottom button (bottom-right, above input bar)
-          Builder(builder: (context) {
-            final showSetting = context.watch<SettingsProvider>().showMessageNavButtons;
-            // Hide nav button in brand-new chats with no messages
-            if (!showSetting || _messages.isEmpty) return const SizedBox.shrink();
-            final cs = Theme.of(context).colorScheme;
-            final isDark = Theme.of(context).brightness == Brightness.dark;
-            final bottomOffset = _inputBarHeight + 12;
-            return Align(
-              alignment: Alignment.bottomRight,
-              child: SafeArea(
-                top: false,
-                bottom: false, // avoid double bottom inset so button hugs input bar
-                child: IgnorePointer(
-                  ignoring: !_showJumpToBottom,
-                  child: AnimatedScale(
-                    scale: _showJumpToBottom ? 1.0 : 0.9,
-                    duration: const Duration(milliseconds: 220),
-                    curve: Curves.easeOutCubic,
-                    child: AnimatedOpacity(
-                      duration: const Duration(milliseconds: 220),
-                      curve: Curves.easeOutCubic,
-                      opacity: _showJumpToBottom ? 1 : 0,
-                      child: Padding(
-                        padding: EdgeInsets.only(right: 16, bottom: bottomOffset),
-                        child: ClipOval(
-                          child: BackdropFilter(
-                            filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: isDark
-                                    ? Colors.white.withOpacity(0.06)
-                                    : Colors.white.withOpacity(0.07),
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                  color: isDark
-                                      ? Colors.white.withOpacity(0.10)
-                                      : Theme.of(context).colorScheme.outline.withOpacity(0.20),
-                                  width: 1,
-                                ),
-                              ),
-                              child: Material(
-                                type: MaterialType.transparency,
-                                shape: const CircleBorder(),
-                                child: InkWell(
-                                  customBorder: const CircleBorder(),
-                                  onTap: _forceScrollToBottom,
-                                  child: Padding(
-                                    padding: const EdgeInsets.all(6),
-                                    child: Icon(
-                                      Lucide.ChevronDown,
-                                      size: 16,
-                                      color: isDark ? Colors.white : Colors.black87,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                    ),
-                  ),
-                ),
-            );
-          }),
-
-          // Scroll-to-previous-question button (stacked above the bottom button)
-          Builder(builder: (context) {
-            final showSetting = context.watch<SettingsProvider>().showMessageNavButtons;
-            if (!showSetting || _messages.isEmpty) return const SizedBox.shrink();
-            final isDark = Theme.of(context).brightness == Brightness.dark;
-            final bottomOffset = _inputBarHeight + 12 + 52; // place above the bottom button with gap
-            // Visibility follows the same logic as the bottom button (hide at bottom)
-            final showUp = _showJumpToBottom;
-            return Align(
-              alignment: Alignment.bottomRight,
-              child: SafeArea(
-                top: false,
-                bottom: false,
-                child: IgnorePointer(
-                  ignoring: !showUp,
-                  child: AnimatedScale(
-                    scale: showUp ? 1.0 : 0.9,
-                    duration: const Duration(milliseconds: 220),
-                    curve: Curves.easeOutCubic,
-                    child: AnimatedOpacity(
-                      duration: const Duration(milliseconds: 220),
-                      curve: Curves.easeOutCubic,
-                      opacity: showUp ? 1 : 0,
-                      child: Padding(
-                        padding: EdgeInsets.only(right: 16, bottom: bottomOffset),
-                        child: ClipOval(
-                          child: BackdropFilter(
-                            filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: isDark
-                                    ? Colors.white.withOpacity(0.06)
-                                    : Colors.white.withOpacity(0.07),
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                  color: isDark
-                                      ? Colors.white.withOpacity(0.10)
-                                      : Theme.of(context).colorScheme.outline.withOpacity(0.20),
-                                  width: 1,
-                                ),
-                              ),
-                              child: Material(
-                                type: MaterialType.transparency,
-                                shape: const CircleBorder(),
-                                child: InkWell(
-                                  customBorder: const CircleBorder(),
-                                  onTap: _jumpToPreviousQuestion,
-                                  child: Padding(
-                                    padding: const EdgeInsets.all(6),
-                                    child: Icon(
-                                      Lucide.ChevronUp,
-                                      size: 16,
-                                      color: isDark ? Colors.white : Colors.black87,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                    ),
-                  ),
-                ),
-            );
-          }),
-        ],
-        ),
-      )),
-      );
-  }
-
-  Widget _buildTabletLayout(
-    BuildContext context, {
-    required String title,
-    required String? providerName,
-    required String? modelDisplay,
-    required ColorScheme cs,
-  }) {
-    final bool _isDesktop = defaultTargetPlatform == TargetPlatform.macOS ||
-        defaultTargetPlatform == TargetPlatform.windows ||
-        defaultTargetPlatform == TargetPlatform.linux;
-    if (_isDesktop && !_desktopUiInited) {
-      _desktopUiInited = true;
-      try {
-        final sp = context.read<SettingsProvider>();
-        _embeddedSidebarWidth = sp.desktopSidebarWidth.clamp(_sidebarMinWidth, _sidebarMaxWidth);
-        _tabletSidebarOpen = sp.desktopSidebarOpen;
-      } catch (_) {}
-    }
-    return Stack(
-      children: [
-        Positioned.fill(child: _buildAssistantBackground(context)),
-        SizedBox.expand(
-      child: Row(
-      children: [
-        _buildTabletSidebar(context),
-        if (_isDesktop)
-          _SidebarResizeHandle(
-            visible: _tabletSidebarOpen,
-            onDrag: (dx) {
-              setState(() {
-                _embeddedSidebarWidth = (_embeddedSidebarWidth + dx).clamp(_sidebarMinWidth, _sidebarMaxWidth);
-              });
-            },
-            onDragEnd: () {
-              try { context.read<SettingsProvider>().setDesktopSidebarWidth(_embeddedSidebarWidth); } catch (_) {}
-            },
-          )
-        else
-          AnimatedContainer(
-            duration: _sidebarAnimDuration,
-            curve: _sidebarAnimCurve,
-            width: _tabletSidebarOpen ? 0.6 : 0,
-            child: _tabletSidebarOpen
-                ? VerticalDivider(
-                    width: 0.6,
-                    thickness: 0.5,
-                    color: cs.outlineVariant.withOpacity(0.20),
-                  )
-                : const SizedBox.shrink(),
-          ),
-        Expanded(
-          child: Scaffold(
-            key: _scaffoldKey,
-            resizeToAvoidBottomInset: true,
-            extendBodyBehindAppBar: true,
-            backgroundColor: Colors.transparent,
-            appBar: AppBar(
-              centerTitle: false,
-              systemOverlayStyle: (Theme.of(context).brightness == Brightness.dark)
-                  ? const SystemUiOverlayStyle(
-                      statusBarColor: Colors.transparent,
-                      statusBarIconBrightness: Brightness.light,
-                      statusBarBrightness: Brightness.dark,
-                    )
-                  : const SystemUiOverlayStyle(
-                      statusBarColor: Colors.transparent,
-                      statusBarIconBrightness: Brightness.dark,
-                      statusBarBrightness: Brightness.light,
-                    ),
-              backgroundColor: Colors.transparent,
-              surfaceTintColor: Colors.transparent,
-              elevation: 0,
-              scrolledUnderElevation: 0,
-              leading: IosIconButton(
+          backgroundColor: Colors.transparent,
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+          leading: Builder(
+            builder: (context) {
+              return IosIconButton(
                 size: 20,
                 padding: const EdgeInsets.all(8),
                 minSize: 40,
@@ -4618,809 +4300,1425 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                   height: 14,
                   colorFilter: ColorFilter.mode(color, BlendMode.srcIn),
                 ),
-                onTap: _toggleTabletSidebar,
+                onTap: () {
+                  // Always dismiss keyboard when toggling the sidebar
+                  _dismissKeyboard();
+                  _drawerController.toggle();
+                },
+              );
+            },
+          ),
+          titleSpacing: 2,
+          title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            // crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              AnimatedTextSwap(
+                text: title,
+                // Desktop稍微收紧标题字号
+                style: TextStyle(
+                  fontSize:
+                      (defaultTargetPlatform == TargetPlatform.macOS ||
+                          defaultTargetPlatform == TargetPlatform.windows ||
+                          defaultTargetPlatform == TargetPlatform.linux)
+                      ? 14
+                      : 16,
+                  fontWeight: FontWeight.w500,
+                ),
               ),
-              titleSpacing: 2,
-              title: Builder(builder: (context) {
-                final isDark = Theme.of(context).brightness == Brightness.dark;
-                final bool isDesktop = defaultTargetPlatform == TargetPlatform.macOS ||
-                    defaultTargetPlatform == TargetPlatform.windows ||
-                    defaultTargetPlatform == TargetPlatform.linux;
-                // Desktop: title and model chip in a single row; Tablet can keep same for consistency
-                final String? brandAsset = (modelDisplay != null
-                        ? (BrandAssets.assetForName(modelDisplay))
-                        : null) ?? (providerName != null ? BrandAssets.assetForName(providerName!) : null);
-
-                Widget? capsule;
-                String? capsuleLabel;
-                if (providerName != null && modelDisplay != null) {
-                  final showProv = context.watch<SettingsProvider>().showProviderInModelCapsule;
-                  capsuleLabel = showProv ? '$modelDisplay | $providerName' : '$modelDisplay';
-                  final Widget brandIcon = AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 200),
-                    transitionBuilder: (child, anim) => FadeTransition(opacity: anim, child: ScaleTransition(scale: anim, child: child)),
-                    child: (brandAsset != null)
-                        ? (brandAsset.endsWith('.svg')
-                            ? SvgPicture.asset(brandAsset, width: 16, height: 16, key: ValueKey('brand:$brandAsset'))
-                            : Image.asset(brandAsset, width: 16, height: 16, key: ValueKey('brand:$brandAsset')))
-                        : Icon(Lucide.Boxes, size: 16, color: cs.onSurface.withOpacity(0.7), key: const ValueKey('brand:default')),
-                  );
-
-                  capsule = IosCardPress(
-                    borderRadius: BorderRadius.circular(20),
-                    // baseColor: isDark ? Colors.white12 : Colors.grey.shade200,
-                    baseColor: Colors.transparent,
-                    // AnimatedContainer inside IosCardPress will animate color on hover/press
-                    // We wrap the content in AnimatedSize to animate width changes
-                    pressedBlendStrength: isDark ? 0.18 : 0.12,
-                    padding: EdgeInsets.zero,
+              if (providerName != null && modelDisplay != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(6),
                     onTap: () => showModelSelectSheet(context),
-                    child: AnimatedSize(
-                      duration: const Duration(milliseconds: 200),
-                      curve: Curves.easeOutCubic,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(14),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 0),
+                      child: AnimatedTextSwap(
+                        text: '$modelDisplay ($providerName)',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: cs.onSurface.withOpacity(0.6),
+                          fontWeight: FontWeight.w500,
                         ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            brandIcon,
-                            const SizedBox(width: 6),
-                            // Allow label to ellipsize within the chip
-                            Flexible(
-                              child: AnimatedTextSwap(
-                                text: capsuleLabel!,
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  height: 1.1,
-                                  color: isDark ? Colors.white.withOpacity(0.92) : cs.onSurface.withOpacity(0.9),
-                                  fontWeight: FontWeight.w500,
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                          ],
-                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                       ),
                     ),
-                  );
+                  ),
+                ),
+            ],
+          ),
+          actions: [
+            // Mini map button (to the left of new conversation)
+            IosIconButton(
+              size: 20,
+              minSize: 44,
+              onTap: () async {
+                final collapsed = _collapseVersions(_messages);
+                String? selectedId;
+                try {
+                  if (Platform.isMacOS ||
+                      Platform.isWindows ||
+                      Platform.isLinux) {
+                    selectedId = await showDesktopMiniMapPopover(
+                      context,
+                      anchorKey: _inputBarKey,
+                      messages: collapsed,
+                    );
+                  } else {
+                    selectedId = await showMiniMapSheet(context, collapsed);
+                  }
+                } catch (_) {
+                  selectedId = await showMiniMapSheet(context, collapsed);
                 }
-
-                // Primary header row: title expands, capsule stays close to title's right side
-                final row = Row(
-                  mainAxisSize: MainAxisSize.max,
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    // Title expands and ellipsizes as needed
-                    Flexible(
-                      fit: FlexFit.loose,
-                      child: AnimatedSize(
-                        duration: const Duration(milliseconds: 220),
-                        curve: Curves.easeOutCubic,
-                        child: AnimatedTextSwap(
-                          text: title,
-                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    ),
-                    if (capsule != null) ...[
-                      const SizedBox(width: 8),
-                      // Capsule scales down to avoid overflow but stays left-aligned
-                      Flexible(
-                        fit: FlexFit.loose,
-                        child: FittedBox(
-                          fit: BoxFit.scaleDown,
-                          alignment: Alignment.centerLeft,
-                          child: AnimatedSwitcher(
-                            duration: const Duration(milliseconds: 220),
-                            transitionBuilder: (child, anim) => FadeTransition(
-                              opacity: anim,
-                              child: SlideTransition(
-                                position: Tween<Offset>(begin: const Offset(0.06, 0), end: Offset.zero).animate(anim),
-                                child: child,
+                if (!mounted) return;
+                if (selectedId != null && selectedId.isNotEmpty) {
+                  await _scrollToMessageId(selectedId);
+                }
+              },
+              semanticLabel: AppLocalizations.of(context)!.miniMapTooltip,
+              icon: Lucide.Map,
+            ),
+            // const SizedBox(width: 4),
+            IosIconButton(
+              size: 22,
+              minSize: 44,
+              onTap: () async {
+                await _createNewConversation();
+                if (mounted) {
+                  // Close drawer if open and scroll to bottom (fresh convo)
+                  _forceScrollToBottomSoon();
+                }
+              },
+              icon: Lucide.MessageCirclePlus,
+            ),
+            const SizedBox(width: 4),
+            // Move the right spacer between mini map and new-topic per request
+          ],
+        ),
+        body: _wrapWithDropTarget(
+          Stack(
+            children: [
+              // Assistant-specific chat background + gradient overlay to improve readability
+              Builder(
+                builder: (context) {
+                  final bg = context
+                      .watch<AssistantProvider>()
+                      .currentAssistant
+                      ?.background;
+                  final maskStrength = context
+                      .watch<SettingsProvider>()
+                      .chatBackgroundMaskStrength;
+                  if (bg == null || bg.trim().isEmpty)
+                    return const SizedBox.shrink();
+                  ImageProvider provider;
+                  if (bg.startsWith('http')) {
+                    provider = NetworkImage(bg);
+                  } else {
+                    final localPath = SandboxPathResolver.fix(bg);
+                    final file = File(localPath);
+                    if (!file.existsSync()) return const SizedBox.shrink();
+                    provider = FileImage(file);
+                  }
+                  return Positioned.fill(
+                    child: Stack(
+                      children: [
+                        // Background image
+                        Positioned.fill(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              image: DecorationImage(
+                                image: provider,
+                                fit: BoxFit.cover,
+                                colorFilter: ColorFilter.mode(
+                                  Colors.black.withOpacity(0.04),
+                                  BlendMode.srcATop,
+                                ),
                               ),
-                            ),
-                            child: KeyedSubtree(
-                              key: ValueKey('cap:${capsuleLabel ?? ''}'),
-                              child: capsule!,
                             ),
                           ),
                         ),
-                      ),
-                    ],
-                  ],
-                );
-
-                // Left-aligned, vertically centered without manual nudges
-                return Align(
-                  alignment: Alignment.centerLeft,
-                  child: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 220),
-                    transitionBuilder: (child, anim) => FadeTransition(
-                      opacity: anim,
-                      child: SlideTransition(
-                        position: Tween<Offset>(begin: const Offset(0, 0.08), end: Offset.zero).animate(anim),
-                        child: child,
-                      ),
+                        // Vertical gradient overlay (top ~20% -> bottom ~50%) using theme background color
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  colors: () {
+                                    final top = (0.20 * maskStrength).clamp(
+                                      0.0,
+                                      1.0,
+                                    );
+                                    final bottom = (0.50 * maskStrength).clamp(
+                                      0.0,
+                                      1.0,
+                                    );
+                                    return [
+                                      cs.background.withOpacity(top),
+                                      cs.background.withOpacity(bottom),
+                                    ];
+                                  }(),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                    child: KeyedSubtree(key: ValueKey('hdr:$title|${capsuleLabel ?? ''}'), child: row),
-                  ),
-                );
-              }),
-              actions: [
-                IosIconButton(
-                  size: 20,
-                  padding: const EdgeInsets.all(8),
-                  minSize: 40,
-                  icon: Lucide.MessageCirclePlus,
-                  onTap: () async {
-                    await _createNewConversation();
-                    if (mounted) _forceScrollToBottomSoon();
-                  },
+                  );
+                },
+              ),
+              // Main column content
+              Padding(
+                padding: EdgeInsets.only(
+                  top: kToolbarHeight + MediaQuery.of(context).padding.top,
                 ),
-                const SizedBox(width: 6),
-              ],
-            ),
-            body: _wrapWithDropTarget(Stack(
-              children: [
-
-                Padding(
-                  padding: EdgeInsets.only(top: kToolbarHeight + MediaQuery.of(context).padding.top),
-                  child: Align(
-                    alignment: Alignment.topCenter,
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 860),
-                      child: Column(
-                        children: [
-                          // Message list (add subtle animate on conversation switch)
-                          Expanded(
-                            child: FadeTransition(
-                              opacity: _convoFade,
-                              child: KeyedSubtree(
-                                key: ValueKey<String>(_currentConversation?.id ?? 'none'),
-                                child: (() {
-                                  final messages = _collapseVersions(_messages);
-                                  final Map<String, List<ChatMessage>> byGroup = <String, List<ChatMessage>>{};
-                                  for (final m in _messages) {
-                                    final gid = (m.groupId ?? m.id);
-                                    byGroup.putIfAbsent(gid, () => <ChatMessage>[]).add(m);
+                child: Column(
+                  children: [
+                    // Chat messages list (animate when switching topic)
+                    Expanded(
+                      child: Builder(
+                        builder: (context) {
+                          final __content = KeyedSubtree(
+                            key: ValueKey<String>(
+                              _currentConversation?.id ?? 'none',
+                            ),
+                            child: (() {
+                              // Stable snapshot for this build (collapse versions)
+                              final messages = _collapseVersions(_messages);
+                              final Map<String, List<ChatMessage>> byGroup =
+                                  <String, List<ChatMessage>>{};
+                              for (final m in _messages) {
+                                final gid = (m.groupId ?? m.id);
+                                byGroup
+                                    .putIfAbsent(gid, () => <ChatMessage>[])
+                                    .add(m);
+                              }
+                              // Map persisted truncateIndex (raw message count) to collapsed index
+                              final int truncRaw =
+                                  _currentConversation?.truncateIndex ?? -1;
+                              int truncCollapsed = -1;
+                              if (truncRaw > 0) {
+                                final seen = <String>{};
+                                final int limit = truncRaw < _messages.length
+                                    ? truncRaw
+                                    : _messages.length;
+                                int count = 0;
+                                for (int i = 0; i < limit; i++) {
+                                  final gid0 =
+                                      (_messages[i].groupId ?? _messages[i].id);
+                                  if (seen.add(gid0)) count++;
+                                }
+                                truncCollapsed = count - 1;
+                              }
+                              final list = ListView.builder(
+                                controller: _scrollController,
+                                padding: const EdgeInsets.only(
+                                  bottom: 16,
+                                  top: 8,
+                                ),
+                                itemCount: messages.length,
+                                keyboardDismissBehavior:
+                                    ScrollViewKeyboardDismissBehavior.onDrag,
+                                itemBuilder: (context, index) {
+                                  if (index < 0 || index >= messages.length) {
+                                    return const SizedBox.shrink();
                                   }
-                                  // Map persisted truncateIndex (raw) to collapsed index
-                                  final int truncRaw = _currentConversation?.truncateIndex ?? -1;
-                                  int truncCollapsed = -1;
-                                  if (truncRaw > 0) {
-                                    final seen = <String>{};
-                                    final int limit = truncRaw < _messages.length ? truncRaw : _messages.length;
-                                    int count = 0;
-                                    for (int i = 0; i < limit; i++) {
-                                      final gid0 = (_messages[i].groupId ?? _messages[i].id);
-                                      if (seen.add(gid0)) count++;
-                                    }
-                                    truncCollapsed = count - 1;
-                                  }
-                                  return ListView.builder(
-                                    controller: _scrollController,
-                                    padding: const EdgeInsets.only(bottom: 16, top: 8),
-                                    itemCount: messages.length,
-                                    keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-                                    itemBuilder: (context, index) {
-                                      if (index < 0 || index >= messages.length) return const SizedBox.shrink();
-                                      final message = messages[index];
-                                      final r = _reasoning[message.id];
-                                      final t = _translations[message.id];
-                                      final chatScale = context.watch<SettingsProvider>().chatFontScale;
-                                      final assistant = context.watch<AssistantProvider>().currentAssistant;
-                                      final useAssist = assistant?.useAssistantAvatar == true;
-                                      final l10n = AppLocalizations.of(context)!;
-                                      final showDivider = truncCollapsed >= 0 && index == truncCollapsed;
-                                      final cs = Theme.of(context).colorScheme;
-                                      final label = l10n.homePageClearContext;
-                                      final divider = Row(
-                                        children: [
-                                          Expanded(child: Divider(color: cs.outlineVariant.withOpacity(0.6), height: 1, thickness: 1)),
-                                          Padding(
-                                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                                            child: Text(label, style: TextStyle(fontSize: 12, color: cs.onSurface.withOpacity(0.6))),
+                                  final message = messages[index];
+                                  final r = _reasoning[message.id];
+                                  final t = _translations[message.id];
+                                  final chatScale = context
+                                      .watch<SettingsProvider>()
+                                      .chatFontScale;
+                                  final assistant = context
+                                      .watch<AssistantProvider>()
+                                      .currentAssistant;
+                                  final useAssist =
+                                      assistant?.useAssistantAvatar == true;
+                                  final l10n = AppLocalizations.of(context)!;
+                                  final showDivider =
+                                      truncCollapsed >= 0 &&
+                                      index == truncCollapsed;
+                                  final cs = Theme.of(context).colorScheme;
+                                  final label = l10n.homePageClearContext;
+                                  final divider = Row(
+                                    children: [
+                                      Expanded(
+                                        child: Divider(
+                                          color: cs.outlineVariant.withOpacity(
+                                            0.6,
                                           ),
-                                          Expanded(child: Divider(color: cs.outlineVariant.withOpacity(0.6), height: 1, thickness: 1)),
-                                        ],
-                                      );
-                                      final gid = (message.groupId ?? message.id);
-                                      final vers = (byGroup[gid] ?? const <ChatMessage>[]).toList()..sort((a,b)=>a.version.compareTo(b.version));
-                                      final selectedIdx = _versionSelections[gid] ?? (vers.isNotEmpty ? vers.length - 1 : 0);
-                                      final total = vers.length;
-                                      final showMsgNav = context.watch<SettingsProvider>().showMessageNavButtons;
-                                      final effectiveTotal = showMsgNav ? total : 1;
-                                      final effectiveIndex = showMsgNav ? selectedIdx : 0;
+                                          height: 1,
+                                          thickness: 1,
+                                        ),
+                                      ),
+                                      Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 10,
+                                        ),
+                                        child: Text(
+                                          label,
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            color: cs.onSurface.withOpacity(
+                                              0.6,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      Expanded(
+                                        child: Divider(
+                                          color: cs.outlineVariant.withOpacity(
+                                            0.6,
+                                          ),
+                                          height: 1,
+                                          thickness: 1,
+                                        ),
+                                      ),
+                                    ],
+                                  );
+                                  final gid = (message.groupId ?? message.id);
+                                  final vers =
+                                      (byGroup[gid] ?? const <ChatMessage>[])
+                                          .toList()
+                                        ..sort(
+                                          (a, b) =>
+                                              a.version.compareTo(b.version),
+                                        );
+                                  final selectedIdx =
+                                      _versionSelections[gid] ??
+                                      (vers.isNotEmpty ? vers.length - 1 : 0);
+                                  final total = vers.length;
+                                  final showMsgNav = context
+                                      .watch<SettingsProvider>()
+                                      .showMessageNavButtons;
+                                  final effectiveTotal = showMsgNav ? total : 1;
+                                  final effectiveIndex = showMsgNav
+                                      ? selectedIdx
+                                      : 0;
 
-                                      return Column(
-                                        key: _keyForMessage(message.id),
-                                        mainAxisSize: MainAxisSize.min,
+                                  return Column(
+                                    key: _keyForMessage(message.id),
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Row(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
                                         children: [
-                                          Row(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
-                                            children: [
-                                              if (_selecting && (message.role == 'user' || message.role == 'assistant'))
-                                                Padding(
-                                                  padding: const EdgeInsets.only(left: 10, right: 6),
-                                                  child: IosCheckbox(
-                                                    value: _selectedItems.contains(message.id),
-                                                    onChanged: (v) {
-                                                      setState(() {
-                                                        if (v) {
-                                                          _selectedItems.add(message.id);
-                                                        } else {
-                                                          _selectedItems.remove(message.id);
-                                                        }
-                                                      });
-                                                    },
-                                                  ),
+                                          if (_selecting &&
+                                              (message.role == 'user' ||
+                                                  message.role == 'assistant'))
+                                            Padding(
+                                              padding: const EdgeInsets.only(
+                                                left: 10,
+                                                right: 6,
+                                              ),
+                                              child: IosCheckbox(
+                                                value: _selectedItems.contains(
+                                                  message.id,
                                                 ),
-                                              Expanded(
-                                                child: MediaQuery(
-                                                  data: MediaQuery.of(context).copyWith(
-                                                    textScaleFactor: MediaQuery.of(context).textScaleFactor * chatScale,
+                                                onChanged: (v) {
+                                                  setState(() {
+                                                    if (v) {
+                                                      _selectedItems.add(
+                                                        message.id,
+                                                      );
+                                                    } else {
+                                                      _selectedItems.remove(
+                                                        message.id,
+                                                      );
+                                                    }
+                                                  });
+                                                },
+                                              ),
+                                            ),
+                                          Expanded(
+                                            child: MediaQuery(
+                                              data: MediaQuery.of(context)
+                                                  .copyWith(
+                                                    textScaleFactor:
+                                                        MediaQuery.of(
+                                                          context,
+                                                        ).textScaleFactor *
+                                                        chatScale,
                                                   ),
-                                                  child: ChatMessageWidget(
-                                                    message: message,
-                                                    versionIndex: effectiveIndex,
-                                                    versionCount: effectiveTotal,
-                                                    onPrevVersion: (showMsgNav && selectedIdx > 0)
-                                                        ? () async {
-                                                            final next = selectedIdx - 1;
-                                                            _versionSelections[gid] = next;
-                                                            await _chatService.setSelectedVersion(_currentConversation!.id, gid, next);
-                                                            if (mounted) setState(() {});
-                                                          }
-                                                        : null,
-                                                    onNextVersion: (showMsgNav && selectedIdx < total - 1)
-                                                        ? () async {
-                                                            final next = selectedIdx + 1;
-                                                            _versionSelections[gid] = next;
-                                                            await _chatService.setSelectedVersion(_currentConversation!.id, gid, next);
-                                                            if (mounted) setState(() {});
-                                                          }
-                                                        : null,
-                                                    modelIcon: (!useAssist && message.role == 'assistant' && message.providerId != null && message.modelId != null)
-                                                        ? _CurrentModelIcon(providerKey: message.providerId, modelId: message.modelId, size: 30)
-                                                        : null,
-                                                    showModelIcon: useAssist ? false : context.watch<SettingsProvider>().showModelIcon,
-                                                    useAssistantAvatar: useAssist && message.role == 'assistant',
-                                                    assistantName: useAssist ? (assistant?.name ?? 'Assistant') : null,
-                                                    assistantAvatar: useAssist ? (assistant?.avatar ?? '') : null,
-                                                    showUserAvatar: context.watch<SettingsProvider>().showUserAvatar,
-                                                    showTokenStats: context.watch<SettingsProvider>().showTokenStats,
-                                                    reasoningText: (message.role == 'assistant') ? (r?.text ?? '') : null,
-                                                    reasoningExpanded: (message.role == 'assistant') ? (r?.expanded ?? false) : false,
-                                                    reasoningLoading: (message.role == 'assistant') ? (r?.finishedAt == null && (r?.text.isNotEmpty == true)) : false,
-                                                    reasoningStartAt: (message.role == 'assistant') ? r?.startAt : null,
-                                                    reasoningFinishedAt: (message.role == 'assistant') ? r?.finishedAt : null,
-                                                    onToggleReasoning: (message.role == 'assistant' && r != null)
-                                                        ? () {
-                                                            setState(() {
-                                                              r.expanded = !r.expanded;
-                                                            });
-                                                          }
-                                                        : null,
-                                                    translationExpanded: t?.expanded ?? true,
-                                                    onToggleTranslation: (message.translation != null && message.translation!.isNotEmpty && t != null)
-                                                        ? () {
-                                                            setState(() {
-                                                              t.expanded = !t.expanded;
-                                                            });
-                                                          }
-                                                        : null,
-                                                    onRegenerate: message.role == 'assistant' ? () { _regenerateAtMessage(message); } : null,
-                                                    onResend: message.role == 'user' ? () { _regenerateAtMessage(message); } : null,
-                                                    onTranslate: message.role == 'assistant' ? () { _translateMessage(message); } : null,
-                                                    onSpeak: message.role == 'assistant'
-                                                        ? () async {
-                                                            final isDesktop = defaultTargetPlatform == TargetPlatform.macOS ||
-                                                                defaultTargetPlatform == TargetPlatform.windows ||
-                                                                defaultTargetPlatform == TargetPlatform.linux;
-                                                            if (isDesktop) {
-                                                              final sp = context.read<SettingsProvider>();
-                                                              final hasNetworkTts = sp.ttsServiceSelected >= 0 && sp.ttsServices.isNotEmpty;
-                                                              if (!hasNetworkTts) {
-                                                                showAppSnackBar(
-                                                                  context,
-                                                                  message: AppLocalizations.of(context)!.desktopTtsPleaseAddProvider,
-                                                                  type: NotificationType.warning,
-                                                                );
-                                                                return;
-                                                              }
-                                                            }
-                                                            final tts = context.read<TtsProvider>();
-                                                            if (!tts.isSpeaking) {
-                                                              await tts.speak(message.content);
-                                                            } else {
-                                                              await tts.stop();
-                                                            }
-                                                          }
-                                                        : null,
-                                                    onEdit: message.role == 'user'
-                                                        ? () async {
-                                                            final isDesktop = defaultTargetPlatform == TargetPlatform.macOS ||
-                                                                defaultTargetPlatform == TargetPlatform.windows ||
-                                                                defaultTargetPlatform == TargetPlatform.linux;
-                                                            final edited = isDesktop
-                                                                ? await showMessageEditDesktopDialog(context, message: message)
-                                                                : await showMessageEditSheet(context, message: message);
-                                                            if (edited != null) {
-                                                              final newMsg = await _chatService.appendMessageVersion(messageId: message.id, content: edited);
-                                                              if (!mounted) return;
-                                                              setState(() {
-                                                                if (newMsg != null) {
-                                                                  _messages.add(newMsg);
-                                                                  final gid2 = (newMsg.groupId ?? newMsg.id);
-                                                                  _versionSelections[gid2] = newMsg.version;
-                                                                }
-                                                              });
-                                                              try {
-                                                                if (newMsg != null && _currentConversation != null) {
-                                                                  final gid2 = (newMsg.groupId ?? newMsg.id);
-                                                                  await _chatService.setSelectedVersion(_currentConversation!.id, gid2, newMsg.version);
-                                                                }
-                                                              } catch (_) {}
-                                                            }
-                                                          }
-                                                        : null,
-                                                    onDelete: message.role == 'user'
-                                                        ? () async {
-                                                            final l10n = AppLocalizations.of(context)!;
-                                                            final confirm = await showDialog<bool>(
-                                                              context: context,
-                                                              builder: (ctx) => AlertDialog(
-                                                                title: Text(l10n.homePageDeleteMessage),
-                                                                content: Text(l10n.homePageDeleteMessageConfirm),
-                                                                actions: [
-                                                                  TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: Text(l10n.homePageCancel)),
-                                                                  TextButton(onPressed: () => Navigator.of(ctx).pop(true), child: Text(l10n.homePageDelete, style: const TextStyle(color: Colors.red))),
-                                                                ],
-                                                              ),
+                                              child: ChatMessageWidget(
+                                                message: message,
+                                                versionIndex: effectiveIndex,
+                                                versionCount: effectiveTotal,
+                                                onPrevVersion:
+                                                    (showMsgNav &&
+                                                        selectedIdx > 0)
+                                                    ? () async {
+                                                        final next =
+                                                            selectedIdx - 1;
+                                                        _versionSelections[gid] =
+                                                            next;
+                                                        await _chatService
+                                                            .setSelectedVersion(
+                                                              _currentConversation!
+                                                                  .id,
+                                                              gid,
+                                                              next,
                                                             );
-                                                            if (confirm == true) {
-                                                              final id = message.id;
-                                                              setState(() {
-                                                                _messages.removeWhere((m) => m.id == id);
-                                                                _reasoning.remove(id);
-                                                                _translations.remove(id);
-                                                                _toolParts.remove(id);
-                                                                _reasoningSegments.remove(id);
-                                                              });
-                                                              await _chatService.deleteMessage(id);
-                                                            }
+                                                        if (mounted)
+                                                          setState(() {});
+                                                      }
+                                                    : null,
+                                                onNextVersion:
+                                                    (showMsgNav &&
+                                                        selectedIdx < total - 1)
+                                                    ? () async {
+                                                        final next =
+                                                            selectedIdx + 1;
+                                                        _versionSelections[gid] =
+                                                            next;
+                                                        await _chatService
+                                                            .setSelectedVersion(
+                                                              _currentConversation!
+                                                                  .id,
+                                                              gid,
+                                                              next,
+                                                            );
+                                                        if (mounted)
+                                                          setState(() {});
+                                                      }
+                                                    : null,
+                                                modelIcon:
+                                                    (!useAssist &&
+                                                        message.role ==
+                                                            'assistant' &&
+                                                        message.providerId !=
+                                                            null &&
+                                                        message.modelId != null)
+                                                    ? _CurrentModelIcon(
+                                                        providerKey:
+                                                            message.providerId,
+                                                        modelId:
+                                                            message.modelId,
+                                                        size: 30,
+                                                      )
+                                                    : null,
+                                                showModelIcon: useAssist
+                                                    ? false
+                                                    : context
+                                                          .watch<
+                                                            SettingsProvider
+                                                          >()
+                                                          .showModelIcon,
+                                                useAssistantAvatar:
+                                                    useAssist &&
+                                                    message.role == 'assistant',
+                                                assistantName: useAssist
+                                                    ? (assistant?.name ??
+                                                          'Assistant')
+                                                    : null,
+                                                assistantAvatar: useAssist
+                                                    ? (assistant?.avatar ?? '')
+                                                    : null,
+                                                showUserAvatar: context
+                                                    .watch<SettingsProvider>()
+                                                    .showUserAvatar,
+                                                showTokenStats: context
+                                                    .watch<SettingsProvider>()
+                                                    .showTokenStats,
+                                                reasoningText:
+                                                    (message.role ==
+                                                        'assistant')
+                                                    ? (r?.text ?? '')
+                                                    : null,
+                                                reasoningExpanded:
+                                                    (message.role ==
+                                                        'assistant')
+                                                    ? (r?.expanded ?? false)
+                                                    : false,
+                                                reasoningLoading:
+                                                    (message.role ==
+                                                        'assistant')
+                                                    ? (r?.finishedAt == null &&
+                                                          (r?.text.isNotEmpty ==
+                                                              true))
+                                                    : false,
+                                                reasoningStartAt:
+                                                    (message.role ==
+                                                        'assistant')
+                                                    ? r?.startAt
+                                                    : null,
+                                                reasoningFinishedAt:
+                                                    (message.role ==
+                                                        'assistant')
+                                                    ? r?.finishedAt
+                                                    : null,
+                                                onToggleReasoning:
+                                                    (message.role ==
+                                                            'assistant' &&
+                                                        r != null)
+                                                    ? () {
+                                                        setState(() {
+                                                          r.expanded =
+                                                              !r.expanded;
+                                                        });
+                                                      }
+                                                    : null,
+                                                translationExpanded:
+                                                    t?.expanded ?? true,
+                                                onToggleTranslation:
+                                                    (message.translation !=
+                                                            null &&
+                                                        message
+                                                            .translation!
+                                                            .isNotEmpty &&
+                                                        t != null)
+                                                    ? () {
+                                                        setState(() {
+                                                          t.expanded =
+                                                              !t.expanded;
+                                                        });
+                                                      }
+                                                    : null,
+                                                onRegenerate:
+                                                    message.role == 'assistant'
+                                                    ? () {
+                                                        _regenerateAtMessage(
+                                                          message,
+                                                        );
+                                                      }
+                                                    : null,
+                                                onResend: message.role == 'user'
+                                                    ? () {
+                                                        _regenerateAtMessage(
+                                                          message,
+                                                        );
+                                                      }
+                                                    : null,
+                                                onTranslate:
+                                                    message.role == 'assistant'
+                                                    ? () {
+                                                        _translateMessage(
+                                                          message,
+                                                        );
+                                                      }
+                                                    : null,
+                                                onSpeak:
+                                                    message.role == 'assistant'
+                                                    ? () async {
+                                                        final isDesktop =
+                                                            defaultTargetPlatform ==
+                                                                TargetPlatform
+                                                                    .macOS ||
+                                                            defaultTargetPlatform ==
+                                                                TargetPlatform
+                                                                    .windows ||
+                                                            defaultTargetPlatform ==
+                                                                TargetPlatform
+                                                                    .linux;
+                                                        if (isDesktop) {
+                                                          final sp = context
+                                                              .read<
+                                                                SettingsProvider
+                                                              >();
+                                                          final hasNetworkTts =
+                                                              sp.ttsServiceSelected >=
+                                                                  0 &&
+                                                              sp
+                                                                  .ttsServices
+                                                                  .isNotEmpty;
+                                                          if (!hasNetworkTts) {
+                                                            showAppSnackBar(
+                                                              context,
+                                                              message:
+                                                                  AppLocalizations.of(
+                                                                    context,
+                                                                  )!.desktopTtsPleaseAddProvider,
+                                                              type:
+                                                                  NotificationType
+                                                                      .warning,
+                                                            );
+                                                            return;
                                                           }
-                                                        : null,
-                                                    onMore: () async {
-                                                      final action = await showMessageMoreSheet(context, message);
-                                                      if (!mounted) return;
-                                                      if (action == MessageMoreAction.delete) {
-                                                        final l10n = AppLocalizations.of(context)!;
+                                                        }
+                                                        final tts = context
+                                                            .read<
+                                                              TtsProvider
+                                                            >();
+                                                        if (!tts.isSpeaking) {
+                                                          await tts.speak(
+                                                            message.content,
+                                                          );
+                                                        } else {
+                                                          await tts.stop();
+                                                        }
+                                                      }
+                                                    : null,
+                                                onEdit: message.role == 'user'
+                                                    ? () async {
+                                                        final isDesktop =
+                                                            defaultTargetPlatform ==
+                                                                TargetPlatform
+                                                                    .macOS ||
+                                                            defaultTargetPlatform ==
+                                                                TargetPlatform
+                                                                    .windows ||
+                                                            defaultTargetPlatform ==
+                                                                TargetPlatform
+                                                                    .linux;
+                                                        final edited = isDesktop
+                                                            ? await showMessageEditDesktopDialog(
+                                                                context,
+                                                                message:
+                                                                    message,
+                                                              )
+                                                            : await showMessageEditSheet(
+                                                                context,
+                                                                message:
+                                                                    message,
+                                                              );
+                                                        if (edited != null) {
+                                                          final newMsg =
+                                                              await _chatService
+                                                                  .appendMessageVersion(
+                                                                    messageId:
+                                                                        message
+                                                                            .id,
+                                                                    content:
+                                                                        edited,
+                                                                  );
+                                                          if (!mounted) return;
+                                                          setState(() {
+                                                            if (newMsg !=
+                                                                null) {
+                                                              _messages.add(
+                                                                newMsg,
+                                                              );
+                                                              final gid2 =
+                                                                  (newMsg
+                                                                      .groupId ??
+                                                                  newMsg.id);
+                                                              _versionSelections[gid2] =
+                                                                  newMsg
+                                                                      .version;
+                                                            }
+                                                          });
+                                                          try {
+                                                            if (newMsg !=
+                                                                    null &&
+                                                                _currentConversation !=
+                                                                    null) {
+                                                              final gid2 =
+                                                                  (newMsg
+                                                                      .groupId ??
+                                                                  newMsg.id);
+                                                              await _chatService
+                                                                  .setSelectedVersion(
+                                                                    _currentConversation!
+                                                                        .id,
+                                                                    gid2,
+                                                                    newMsg
+                                                                        .version,
+                                                                  );
+                                                            }
+                                                          } catch (_) {}
+                                                        }
+                                                      }
+                                                    : null,
+                                                onDelete: message.role == 'user'
+                                                    ? () async {
+                                                        final l10n =
+                                                            AppLocalizations.of(
+                                                              context,
+                                                            )!;
                                                         final confirm = await showDialog<bool>(
                                                           context: context,
                                                           builder: (ctx) => AlertDialog(
-                                                            title: Text(l10n.homePageDeleteMessage),
-                                                            content: Text(l10n.homePageDeleteMessageConfirm),
+                                                            title: Text(
+                                                              l10n.homePageDeleteMessage,
+                                                            ),
+                                                            content: Text(
+                                                              l10n.homePageDeleteMessageConfirm,
+                                                            ),
                                                             actions: [
-                                                              TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: Text(l10n.homePageCancel)),
-                                                              TextButton(onPressed: () => Navigator.of(ctx).pop(true), child: Text(l10n.homePageDelete, style: const TextStyle(color: Colors.red))),
+                                                              TextButton(
+                                                                onPressed: () =>
+                                                                    Navigator.of(
+                                                                      ctx,
+                                                                    ).pop(
+                                                                      false,
+                                                                    ),
+                                                                child: Text(
+                                                                  l10n.homePageCancel,
+                                                                ),
+                                                              ),
+                                                              TextButton(
+                                                                onPressed: () =>
+                                                                    Navigator.of(
+                                                                      ctx,
+                                                                    ).pop(true),
+                                                                child: Text(
+                                                                  l10n.homePageDelete,
+                                                                  style: const TextStyle(
+                                                                    color: Colors
+                                                                        .red,
+                                                                  ),
+                                                                ),
+                                                              ),
                                                             ],
                                                           ),
                                                         );
                                                         if (confirm == true) {
                                                           final id = message.id;
                                                           setState(() {
-                                                            _messages.removeWhere((m) => m.id == id);
-                                                            _reasoning.remove(id);
-                                                            _translations.remove(id);
-                                                            _toolParts.remove(id);
-                                                            _reasoningSegments.remove(id);
+                                                            _messages
+                                                                .removeWhere(
+                                                                  (m) =>
+                                                                      m.id ==
+                                                                      id,
+                                                                );
+                                                            _reasoning.remove(
+                                                              id,
+                                                            );
+                                                            _translations
+                                                                .remove(id);
+                                                            _toolParts.remove(
+                                                              id,
+                                                            );
+                                                            _reasoningSegments
+                                                                .remove(id);
                                                           });
-                                                          await _chatService.deleteMessage(id);
+                                                          await _chatService
+                                                              .deleteMessage(
+                                                                id,
+                                                              );
                                                         }
-                                                      } else if (action == MessageMoreAction.edit) {
-                                                        final isDesktop = defaultTargetPlatform == TargetPlatform.macOS ||
-                                                            defaultTargetPlatform == TargetPlatform.windows ||
-                                                            defaultTargetPlatform == TargetPlatform.linux;
-                                                        final edited = isDesktop
-                                                            ? await showMessageEditDesktopDialog(context, message: message)
-                                                            : await showMessageEditSheet(context, message: message);
-                                                        if (edited != null) {
-                                                          final newMsg = await _chatService.appendMessageVersion(messageId: message.id, content: edited);
-                                                          if (!mounted) return;
-                                                          setState(() {
-                                                            if (newMsg != null) {
-                                                              _messages.add(newMsg);
-                                                              final gid = (newMsg.groupId ?? newMsg.id);
-                                                              _versionSelections[gid] = newMsg.version;
-                                                            }
-                                                          });
-                                                          try {
-                                                            if (newMsg != null && _currentConversation != null) {
-                                                              final gid = (newMsg.groupId ?? newMsg.id);
-                                                              await _chatService.setSelectedVersion(_currentConversation!.id, gid, newMsg.version);
-                                                            }
-                                                          } catch (_) {}
-                                                        }
-                                                      } else if (action == MessageMoreAction.fork) {
-                                                        // Determine included groups up to the message's group (inclusive)
-                                                        final Map<String, int> groupFirstIndex = <String, int>{};
-                                                        final List<String> groupOrder = <String>[];
-                                                        for (int i = 0; i < _messages.length; i++) {
-                                                          final gid0 = (_messages[i].groupId ?? _messages[i].id);
-                                                          if (!groupFirstIndex.containsKey(gid0)) {
-                                                            groupFirstIndex[gid0] = i;
-                                                            groupOrder.add(gid0);
-                                                          }
-                                                        }
-                                                        final targetGroup = (message.groupId ?? message.id);
-                                                        final targetOrderIndex = groupOrder.indexOf(targetGroup);
-                                                        if (targetOrderIndex >= 0) {
-                                                          final includeGroups = groupOrder.take(targetOrderIndex + 1).toSet();
-                                                          final selected = [
-                                                            for (final m in _messages)
-                                                              if (includeGroups.contains(m.groupId ?? m.id)) m
-                                                          ];
-                                                          // Filter version selections to included groups
-                                                          final sel = <String, int>{};
-                                                          for (final gid in includeGroups) {
-                                                            final v = _versionSelections[gid];
-                                                            if (v != null) sel[gid] = v;
-                                                          }
-                                                          final newConvo = await _chatService.forkConversation(
-                                                            title: _titleForLocale(context),
-                                                            assistantId: _currentConversation?.assistantId,
-                                                            sourceMessages: selected,
-                                                            versionSelections: sel,
-                                                          );
-                                    // Switch to the new conversation; skip fade on desktop for instant switch
-                                    if (!mounted) return;
-                                    if (!_isDesktopPlatform) {
-                                      await _convoFadeController.reverse();
-                                    }
-                                    _chatService.setCurrentConversation(newConvo.id);
-                                    final msgs = _chatService.getMessages(newConvo.id);
-                                    if (!mounted) return;
-                                    setState(() {
-                                      _currentConversation = newConvo;
-                                      _messages = List.of(msgs);
-                                      _loadVersionSelections();
-                                      _restoreMessageUiState();
-                                    });
-                                    try { await WidgetsBinding.instance.endOfFrame; } catch (_) {}
-                                    _scrollToBottom();
-                                    if (!_isDesktopPlatform) {
-                                      await _convoFadeController.forward();
-                                    }
-                                                        }
-                                                      } else if (action == MessageMoreAction.share) {
-                                                        setState(() {
-                                                          _selecting = true;
-                                                          _selectedItems.clear();
-                                                          final idx = messages.indexWhere((m) => m.id == message.id);
-                                                          for (int i = 0; i <= idx && i < messages.length; i++) {
-                                                            final m = messages[i];
-                                                            final enabled0 = (m.role == 'user' || m.role == 'assistant');
-                                                            if (enabled0) _selectedItems.add(m.id);
-                                                          }
-                                                        });
-                                                      } else if (action == null) {
-                                                        // do nothing
-                                                      } else {
-                                                        // Select action (legacy string)
-                                                        setState(() {
-                                                          _selecting = true;
-                                                          _selectedItems.add(message.id);
-                                                        });
                                                       }
-                                                    },
-                                                    // Ensure tool call/search/citation cards render on tablets too
-                                                    toolParts: message.role == 'assistant' ? _toolParts[message.id] : null,
-                                                    reasoningSegments: message.role == 'assistant'
-                                                        ? (() {
-                                                            final segments = _reasoningSegments[message.id];
-                                                            if (segments == null || segments.isEmpty) return null;
-                                                            return segments
-                                                                .map((s) => ReasoningSegment(
-                                                                      text: s.text,
-                                                                      expanded: s.expanded,
-                                                                      loading: s.finishedAt == null && s.text.isNotEmpty,
-                                                                      startAt: s.startAt,
-                                                                      finishedAt: s.finishedAt,
-                                                                      onToggle: () {
-                                                                        setState(() {
-                                                                          s.expanded = !s.expanded;
-                                                                        });
-                                                                      },
-                                                                      toolStartIndex: s.toolStartIndex,
-                                                                    ))
-                                                                .toList();
-                                                          })()
-                                                        : null,
-                                                  ),
-                                                ),
+                                                    : null,
+                                                onMore: () async {
+                                                  final action =
+                                                      await showMessageMoreSheet(
+                                                        context,
+                                                        message,
+                                                      );
+                                                  if (!mounted) return;
+                                                  if (action ==
+                                                      MessageMoreAction
+                                                          .delete) {
+                                                    final l10n =
+                                                        AppLocalizations.of(
+                                                          context,
+                                                        )!;
+                                                    final confirm = await showDialog<bool>(
+                                                      context: context,
+                                                      builder: (ctx) => AlertDialog(
+                                                        title: Text(
+                                                          l10n.homePageDeleteMessage,
+                                                        ),
+                                                        content: Text(
+                                                          l10n.homePageDeleteMessageConfirm,
+                                                        ),
+                                                        actions: [
+                                                          TextButton(
+                                                            onPressed: () =>
+                                                                Navigator.of(
+                                                                  ctx,
+                                                                ).pop(false),
+                                                            child: Text(
+                                                              l10n.homePageCancel,
+                                                            ),
+                                                          ),
+                                                          TextButton(
+                                                            onPressed: () =>
+                                                                Navigator.of(
+                                                                  ctx,
+                                                                ).pop(true),
+                                                            child: Text(
+                                                              l10n.homePageDelete,
+                                                              style:
+                                                                  const TextStyle(
+                                                                    color: Colors
+                                                                        .red,
+                                                                  ),
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      ),
+                                                    );
+                                                    if (confirm == true) {
+                                                      final id = message.id;
+                                                      setState(() {
+                                                        _messages.removeWhere(
+                                                          (m) => m.id == id,
+                                                        );
+                                                        _reasoning.remove(id);
+                                                        _translations.remove(
+                                                          id,
+                                                        );
+                                                        _toolParts.remove(id);
+                                                        _reasoningSegments
+                                                            .remove(id);
+                                                      });
+                                                      await _chatService
+                                                          .deleteMessage(id);
+                                                    }
+                                                  } else if (action ==
+                                                      MessageMoreAction.edit) {
+                                                    final isDesktop =
+                                                        defaultTargetPlatform ==
+                                                            TargetPlatform
+                                                                .macOS ||
+                                                        defaultTargetPlatform ==
+                                                            TargetPlatform
+                                                                .windows ||
+                                                        defaultTargetPlatform ==
+                                                            TargetPlatform
+                                                                .linux;
+                                                    final edited = isDesktop
+                                                        ? await showMessageEditDesktopDialog(
+                                                            context,
+                                                            message: message,
+                                                          )
+                                                        : await showMessageEditSheet(
+                                                            context,
+                                                            message: message,
+                                                          );
+                                                    if (edited != null) {
+                                                      final newMsg =
+                                                          await _chatService
+                                                              .appendMessageVersion(
+                                                                messageId:
+                                                                    message.id,
+                                                                content: edited,
+                                                              );
+                                                      if (!mounted) return;
+                                                      setState(() {
+                                                        if (newMsg != null) {
+                                                          _messages.add(newMsg);
+                                                          final gid =
+                                                              (newMsg.groupId ??
+                                                              newMsg.id);
+                                                          _versionSelections[gid] =
+                                                              newMsg.version;
+                                                        }
+                                                      });
+                                                      try {
+                                                        if (newMsg != null &&
+                                                            _currentConversation !=
+                                                                null) {
+                                                          final gid =
+                                                              (newMsg.groupId ??
+                                                              newMsg.id);
+                                                          await _chatService
+                                                              .setSelectedVersion(
+                                                                _currentConversation!
+                                                                    .id,
+                                                                gid,
+                                                                newMsg.version,
+                                                              );
+                                                        }
+                                                      } catch (_) {}
+                                                    }
+                                                  } else if (action ==
+                                                      MessageMoreAction.fork) {
+                                                    // Determine included groups up to the message's group (inclusive)
+                                                    final Map<String, int>
+                                                    groupFirstIndex =
+                                                        <String, int>{};
+                                                    final List<String>
+                                                    groupOrder = <String>[];
+                                                    for (
+                                                      int i = 0;
+                                                      i < _messages.length;
+                                                      i++
+                                                    ) {
+                                                      final gid0 =
+                                                          (_messages[i]
+                                                              .groupId ??
+                                                          _messages[i].id);
+                                                      if (!groupFirstIndex
+                                                          .containsKey(gid0)) {
+                                                        groupFirstIndex[gid0] =
+                                                            i;
+                                                        groupOrder.add(gid0);
+                                                      }
+                                                    }
+                                                    final targetGroup =
+                                                        (message.groupId ??
+                                                        message.id);
+                                                    final targetOrderIndex =
+                                                        groupOrder.indexOf(
+                                                          targetGroup,
+                                                        );
+                                                    if (targetOrderIndex >= 0) {
+                                                      final includeGroups =
+                                                          groupOrder
+                                                              .take(
+                                                                targetOrderIndex +
+                                                                    1,
+                                                              )
+                                                              .toSet();
+                                                      final selected = [
+                                                        for (final m
+                                                            in _messages)
+                                                          if (includeGroups
+                                                              .contains(
+                                                                m.groupId ??
+                                                                    m.id,
+                                                              ))
+                                                            m,
+                                                      ];
+                                                      // Filter version selections to included groups
+                                                      final sel =
+                                                          <String, int>{};
+                                                      for (final gid
+                                                          in includeGroups) {
+                                                        final v =
+                                                            _versionSelections[gid];
+                                                        if (v != null)
+                                                          sel[gid] = v;
+                                                      }
+                                                      final newConvo = await _chatService
+                                                          .forkConversation(
+                                                            title:
+                                                                _titleForLocale(
+                                                                  context,
+                                                                ),
+                                                            assistantId:
+                                                                _currentConversation
+                                                                    ?.assistantId,
+                                                            sourceMessages:
+                                                                selected,
+                                                            versionSelections:
+                                                                sel,
+                                                          );
+                                                      // Switch to the new conversation; skip fade on desktop for instant switch
+                                                      if (!mounted) return;
+                                                      if (!_isDesktopPlatform) {
+                                                        await _convoFadeController
+                                                            .reverse();
+                                                      }
+                                                      _chatService
+                                                          .setCurrentConversation(
+                                                            newConvo.id,
+                                                          );
+                                                      final msgs = _chatService
+                                                          .getMessages(
+                                                            newConvo.id,
+                                                          );
+                                                      if (!mounted) return;
+                                                      setState(() {
+                                                        _currentConversation =
+                                                            newConvo;
+                                                        _messages = List.of(
+                                                          msgs,
+                                                        );
+                                                        _loadVersionSelections();
+                                                        _restoreMessageUiState();
+                                                      });
+                                                      try {
+                                                        await WidgetsBinding
+                                                            .instance
+                                                            .endOfFrame;
+                                                      } catch (_) {}
+                                                      _scrollToBottom();
+                                                      if (!_isDesktopPlatform) {
+                                                        await _convoFadeController
+                                                            .forward();
+                                                      }
+                                                    }
+                                                  } else if (action ==
+                                                      MessageMoreAction.share) {
+                                                    // Enter selection mode and preselect up to this message (inclusive)
+                                                    setState(() {
+                                                      _selecting = true;
+                                                      _selectedItems.clear();
+                                                      for (
+                                                        int i = 0;
+                                                        i <= index &&
+                                                            i < messages.length;
+                                                        i++
+                                                      ) {
+                                                        final m = messages[i];
+                                                        final enabled0 =
+                                                            (m.role == 'user' ||
+                                                            m.role ==
+                                                                'assistant');
+                                                        if (enabled0)
+                                                          _selectedItems.add(
+                                                            m.id,
+                                                          );
+                                                      }
+                                                    });
+                                                  }
+                                                },
+                                                toolParts:
+                                                    message.role == 'assistant'
+                                                    ? _toolParts[message.id]
+                                                    : null,
+                                                reasoningSegments:
+                                                    message.role == 'assistant'
+                                                    ? (() {
+                                                        final segments =
+                                                            _reasoningSegments[message
+                                                                .id];
+                                                        if (segments == null ||
+                                                            segments.isEmpty)
+                                                          return null;
+                                                        return segments
+                                                            .map(
+                                                              (
+                                                                s,
+                                                              ) => ReasoningSegment(
+                                                                text: s.text,
+                                                                expanded:
+                                                                    s.expanded,
+                                                                loading:
+                                                                    s.finishedAt ==
+                                                                        null &&
+                                                                    s
+                                                                        .text
+                                                                        .isNotEmpty,
+                                                                startAt:
+                                                                    s.startAt,
+                                                                finishedAt: s
+                                                                    .finishedAt,
+                                                                onToggle: () {
+                                                                  setState(() {
+                                                                    s.expanded =
+                                                                        !s.expanded;
+                                                                  });
+                                                                },
+                                                                toolStartIndex:
+                                                                    s.toolStartIndex,
+                                                              ),
+                                                            )
+                                                            .toList();
+                                                      })()
+                                                    : null,
                                               ),
-                                            ],
+                                            ),
                                           ),
-                                          if (showDivider)
-                                            Padding(padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12), child: divider),
                                         ],
-                                      );
-                                    },
+                                      ),
+                                      if (showDivider)
+                                        Padding(
+                                          padding: const EdgeInsets.symmetric(
+                                            vertical: 10,
+                                            horizontal: AppSpacing.md,
+                                          ),
+                                          child: divider,
+                                        ),
+                                    ],
                                   );
-                                })(),
-                              ).animate(key: ValueKey('tab_body_'+(_currentConversation?.id ?? 'none')))
-                               .fadeIn(duration: 200.ms, curve: Curves.easeOutCubic),
-                               // .slideY(begin: 0.02, end: 0, duration: 240.ms, curve: Curves.easeOutCubic),
-                            ),
-                          ),
-
-                          // Input bar with max width
-                          NotificationListener<SizeChangedLayoutNotification>(
-                            onNotification: (n) {
-                              WidgetsBinding.instance.addPostFrameCallback((_) => _measureInputBar());
-                              return false;
-                            },
-                            child: SizeChangedLayoutNotifier(
-                              child: Builder(
-                                builder: (context) {
-                                  final settings = context.watch<SettingsProvider>();
-                                  final ap = context.watch<AssistantProvider>();
-                                  final a = ap.currentAssistant;
-                                  final pk = a?.chatModelProvider ?? settings.currentModelProvider;
-                                  final mid = a?.chatModelId ?? settings.currentModelId;
-                                  if (pk != null && mid != null) {
-                                    final supportsTools = _isToolModel(pk, mid);
-                                    if (!supportsTools && (a?.mcpServerIds.isNotEmpty ?? false)) {
-                                      WidgetsBinding.instance.addPostFrameCallback((_) {
-                                        final aa = ap.currentAssistant;
-                                        if (aa != null && aa.mcpServerIds.isNotEmpty) {
-                                          ap.updateAssistant(aa.copyWith(mcpServerIds: const <String>[]));
-                                        }
-                                      });
-                                    }
-                                    final supportsReasoning = _isReasoningModel(pk, mid);
-                                    if (!supportsReasoning && a != null) {
-                                      final enabledNow = _isReasoningEnabled(a.thinkingBudget ?? settings.thinkingBudget);
-                                      if (enabledNow) {
-                                        WidgetsBinding.instance.addPostFrameCallback((_) async {
-                                          final aa = ap.currentAssistant;
-                                          if (aa != null) {
-                                            await ap.updateAssistant(aa.copyWith(thinkingBudget: 0));
-                                          }
-                                        });
-                                      }
-                                    }
-                                  }
-                                  final currentProvider = a?.chatModelProvider ?? settings.currentModelProvider;
-                                  final currentModelId = a?.chatModelId ?? settings.currentModelId;
-                                  final cfg = (currentProvider != null) ? settings.getProviderConfig(currentProvider) : null;
-                                  bool builtinSearchActive = false;
-                                  if (cfg != null && currentModelId != null) {
-                                    final mid2 = currentModelId;
-                                    final isGeminiOfficial = cfg.providerType == ProviderKind.google && (cfg.vertexAI != true);
-                                    final isClaude = cfg.providerType == ProviderKind.claude;
-                                    final isOpenAIResponses = cfg.providerType == ProviderKind.openai && (cfg.useResponseApi == true);
-                                    if (isGeminiOfficial || isClaude || isOpenAIResponses) {
-                                      final ov = cfg.modelOverrides[mid2] as Map?;
-                                      final list = (ov?['builtInTools'] as List?) ?? const <dynamic>[];
-                                      builtinSearchActive = list.map((e) => e.toString().toLowerCase()).contains('search');
-                                    }
-                                  }
-
-                                  final isDesktop = defaultTargetPlatform == TargetPlatform.macOS ||
-                                      defaultTargetPlatform == TargetPlatform.windows ||
-                                      defaultTargetPlatform == TargetPlatform.linux;
-                                  Widget input = ChatInputBar(
-                                    key: _inputBarKey,
-                                    onMore: _toggleTools,
-                                    searchEnabled: context.watch<SettingsProvider>().searchEnabled || builtinSearchActive,
-                                    onToggleSearch: (enabled) {
-                                      context.read<SettingsProvider>().setSearchEnabled(enabled);
-                                    },
-                                    onSelectModel: () => showModelSelectSheet(context),
-                                    onLongPressSelectModel: () {
-                                      Navigator.of(context).push(
-                                        MaterialPageRoute(builder: (_) => const ProvidersPage()),
-                                      );
-                                    },
-                                    onOpenMcp: () {
-                                      final a = context.read<AssistantProvider>().currentAssistant;
-                                      if (a != null) {
-                                        try {
-                                          if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
-                                            showDesktopMcpServersPopover(context, anchorKey: _inputBarKey, assistantId: a.id);
-                                          } else {
-                                            showAssistantMcpSheet(context, assistantId: a.id);
-                                          }
-                                        } catch (_) {
-                                          showAssistantMcpSheet(context, assistantId: a.id);
-                                        }
-                                      }
-                                    },
-                                    onLongPressMcp: () {
-                                      Navigator.of(context).push(
-                                        MaterialPageRoute(builder: (_) => const McpPage()),
-                                      );
-                                    },
-                                    // Quick Phrase button (tablet): show to the right of MCP
-                                    showQuickPhraseButton: (() {
-                                      final assistant = context.watch<AssistantProvider>().currentAssistant;
-                                      final quickPhraseProvider = context.watch<QuickPhraseProvider>();
-                                      final globalCount = quickPhraseProvider.globalPhrases.length;
-                                      final assistantCount = assistant != null
-                                          ? quickPhraseProvider.getForAssistant(assistant.id).length
-                                          : 0;
-                                      return (globalCount + assistantCount) > 0;
-                                    })(),
-                                    onQuickPhrase: _showQuickPhraseMenu,
-                                    onLongPressQuickPhrase: () {
-                                      Navigator.of(context).push(
-                                        MaterialPageRoute(builder: (_) => const QuickPhrasesPage()),
-                                      );
-                                    },
-                                    showMiniMapButton: true,
-                                    onOpenMiniMap: () async {
-                                      final collapsed = _collapseVersions(_messages);
-                                      String? selectedId;
-                                      try {
-                                        if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
-                                          selectedId = await showDesktopMiniMapPopover(context, anchorKey: _inputBarKey, messages: collapsed);
-                                        } else {
-                                          selectedId = await showMiniMapSheet(context, collapsed);
-                                        }
-                                      } catch (_) {
-                                        selectedId = await showMiniMapSheet(context, collapsed);
-                                      }
-                                      if (selectedId != null && selectedId.isNotEmpty) {
-                                        await _scrollToMessageId(selectedId);
-                                      }
-                                    },
-                                    onPickCamera: isDesktop ? null : _onPickCamera,
-                                    onPickPhotos: isDesktop ? null : _onPickPhotos,
-                                    onUploadFiles: _onPickFiles,
-                                    onToggleLearningMode: () async {
-                                      final enabled = await LearningModeStore.isEnabled();
-                                      await LearningModeStore.setEnabled(!enabled);
-                                      if (mounted) setState(() => _learningModeEnabled = !enabled);
-                                    },
-                                    onLongPressLearning: _showLearningPromptSheet,
-                                    learningModeActive: _learningModeEnabled,
-                                    showMoreButton: false,
-                                    onClearContext: _onClearContext,
-                                    onStop: _cancelStreaming,
-                                    modelIcon: (settings.showModelIcon && ((a?.chatModelProvider ?? settings.currentModelProvider) != null) && ((a?.chatModelId ?? settings.currentModelId) != null))
-                                        ? _CurrentModelIcon(
-                                            providerKey: a?.chatModelProvider ?? settings.currentModelProvider,
-                                            modelId: a?.chatModelId ?? settings.currentModelId,
-                                            size: 40,
-                                            withBackground: true,
-                                            backgroundColor: Colors.transparent,
-                                          )
-                                        : null,
-                                    focusNode: _inputFocus,
-                                    controller: _inputController,
-                                    mediaController: _mediaController,
-                                    onConfigureReasoning: () async {
-                                      final assistant = context.read<AssistantProvider>().currentAssistant;
-                                      if (assistant != null) {
-                                        if (assistant.thinkingBudget != null) {
-                                          context.read<SettingsProvider>().setThinkingBudget(assistant.thinkingBudget);
-                                        }
-                                        await _openReasoningSettings();
-                                        final chosen = context.read<SettingsProvider>().thinkingBudget;
-                                        await context.read<AssistantProvider>().updateAssistant(
-                                          assistant.copyWith(thinkingBudget: chosen),
-                                        );
-                                      }
-                                    },
-                                    reasoningActive: _isReasoningEnabled((context.watch<AssistantProvider>().currentAssistant?.thinkingBudget) ?? settings.thinkingBudget),
-                                    supportsReasoning: (pk != null && mid != null) ? _isReasoningModel(pk, mid) : false,
-                                    onOpenSearch: _openSearchSettings,
-                                    onSend: (text) {
-                                      _sendMessage(text);
-                                      _inputController.clear();
-                                      if (Platform.isAndroid || Platform.isIOS) {
-                                        _dismissKeyboard();
-                                      } else {
-                                        _inputFocus.requestFocus();
-                                      }
-                                    },
-                                    loading: _isCurrentConversationLoading,
-                                    showMcpButton: (() {
-                                      final pk2 = a?.chatModelProvider ?? settings.currentModelProvider;
-                                      final mid3 = a?.chatModelId ?? settings.currentModelId;
-                                      if (pk2 == null || mid3 == null) return false;
-                                      return _isToolModel(pk2, mid3) && context.watch<McpProvider>().servers.isNotEmpty;
-                                    })(),
-                                    mcpActive: (() {
-                                      final a = context.watch<AssistantProvider>().currentAssistant;
-                                      final connected = context.watch<McpProvider>().connectedServers;
-                                      final selected = a?.mcpServerIds ?? const <String>[];
-                                      if (selected.isEmpty || connected.isEmpty) return false;
-                                      return connected.any((s) => selected.contains(s.id));
-                                    })(),
-                                  );
-
-                                  input = Center(
-                                    child: ConstrainedBox(
-                                      constraints: const BoxConstraints(maxWidth: 800),
-                                      child: input,
-                                    ),
-                                  );
-                                  return input;
                                 },
-                              ),
-                            ),
-                          ),
-                        ],
+                              );
+                              return list;
+                            })(),
+                          );
+                          final isAndroid =
+                              Theme.of(context).platform ==
+                              TargetPlatform.android;
+                          Widget w = __content;
+                          if (!isAndroid) {
+                            w = w
+                                .animate(
+                                  key: ValueKey(
+                                    'mob_body_' +
+                                        (_currentConversation?.id ?? 'none'),
+                                  ),
+                                )
+                                .fadeIn(
+                                  duration: 200.ms,
+                                  curve: Curves.easeOutCubic,
+                                );
+                            // .slideY(begin: 0.02, end: 0, duration: 240.ms, curve: Curves.easeOutCubic);
+                            w = FadeTransition(opacity: _convoFade, child: w);
+                          }
+                          return w;
+                        },
                       ),
                     ),
-                  ),
-                ),
-
-                // Selection toolbar overlay (tablet) with iOS glass capsule + animations
-                Align(
-                  alignment: Alignment.bottomCenter,
-                  child: SafeArea(
-                    top: false,
-                    child: Padding(
-                      // Move higher: 72 + 12 + 38
-                      padding: const EdgeInsets.only(bottom: 122),
-                      child: _AnimatedSelectionBar(
-                        visible: _selecting,
-                        child: _SelectionToolbar(
-                          onCancel: () {
-                            setState(() {
-                              _selecting = false;
-                              _selectedItems.clear();
-                            });
-                          },
-                          onConfirm: () async {
-                            final convo = _currentConversation;
-                            if (convo == null) return;
-                            final collapsed = _collapseVersions(_messages);
-                            final selected = <ChatMessage>[];
-                            for (final m in collapsed) {
-                              if (_selectedItems.contains(m.id)) selected.add(m);
-                            }
-                            if (selected.isEmpty) {
-                              final l10n = AppLocalizations.of(context)!;
-                              showAppSnackBar(
-                                context,
-                                message: l10n.homePageSelectMessagesToShare,
-                                type: NotificationType.info,
+                    // Input bar
+                    NotificationListener<SizeChangedLayoutNotification>(
+                      onNotification: (n) {
+                        WidgetsBinding.instance.addPostFrameCallback(
+                          (_) => _measureInputBar(),
+                        );
+                        return false;
+                      },
+                      child: SizeChangedLayoutNotifier(
+                        child: Builder(
+                          builder: (context) {
+                            // Enforce model capabilities: disable MCP selection if model doesn't support tools
+                            final settings = context.watch<SettingsProvider>();
+                            final ap = context.watch<AssistantProvider>();
+                            final a = ap.currentAssistant;
+                            // Use assistant's model if set, otherwise fall back to global default
+                            final pk =
+                                a?.chatModelProvider ??
+                                settings.currentModelProvider;
+                            final mid =
+                                a?.chatModelId ?? settings.currentModelId;
+                            if (pk != null && mid != null) {
+                              final supportsTools = _isToolModel(pk, mid);
+                              if (!supportsTools &&
+                                  (a?.mcpServerIds.isNotEmpty ?? false)) {
+                                WidgetsBinding.instance.addPostFrameCallback((
+                                  _,
+                                ) {
+                                  final aa = ap.currentAssistant;
+                                  if (aa != null &&
+                                      aa.mcpServerIds.isNotEmpty) {
+                                    ap.updateAssistant(
+                                      aa.copyWith(
+                                        mcpServerIds: const <String>[],
+                                      ),
+                                    );
+                                  }
+                                });
+                              }
+                              final supportsReasoning = _isReasoningModel(
+                                pk,
+                                mid,
                               );
-                              return;
+                              if (!supportsReasoning && a != null) {
+                                final enabledNow = _isReasoningEnabled(
+                                  a.thinkingBudget ?? settings.thinkingBudget,
+                                );
+                                if (enabledNow) {
+                                  WidgetsBinding.instance.addPostFrameCallback((
+                                    _,
+                                  ) async {
+                                    final aa = ap.currentAssistant;
+                                    if (aa != null) {
+                                      await ap.updateAssistant(
+                                        aa.copyWith(thinkingBudget: 0),
+                                      );
+                                    }
+                                  });
+                                }
+                              }
                             }
-                            setState(() { _selecting = false; });
-                            await showChatExportSheet(context, conversation: convo, selectedMessages: selected);
-                            if (mounted) setState(() { _selectedItems.clear(); });
+                            // Compute whether built-in built-in search (Gemini official or Claude) is active to highlight the search button
+                            final currentProvider =
+                                a?.chatModelProvider ??
+                                settings.currentModelProvider;
+                            final currentModelId =
+                                a?.chatModelId ?? settings.currentModelId;
+                            final cfg = (currentProvider != null)
+                                ? settings.getProviderConfig(currentProvider)
+                                : null;
+                            bool builtinSearchActive = false;
+                            if (cfg != null && currentModelId != null) {
+                              final mid2 = currentModelId;
+                              final isGeminiOfficial =
+                                  cfg.providerType == ProviderKind.google &&
+                                  (cfg.vertexAI != true);
+                              final isClaude =
+                                  cfg.providerType == ProviderKind.claude;
+                              final isOpenAIResponses =
+                                  cfg.providerType == ProviderKind.openai &&
+                                  (cfg.useResponseApi == true);
+                              if (isGeminiOfficial ||
+                                  isClaude ||
+                                  isOpenAIResponses) {
+                                final ov = cfg.modelOverrides[mid2] as Map?;
+                                final list =
+                                    (ov?['builtInTools'] as List?) ??
+                                    const <dynamic>[];
+                                builtinSearchActive = list
+                                    .map((e) => e.toString().toLowerCase())
+                                    .contains('search');
+                              }
+                            }
+                            return ChatInputBar(
+                              key: _inputBarKey,
+                              onMore: _toggleTools,
+                              // Highlight when app-level search enabled OR model built-in search enabled
+                              searchEnabled:
+                                  context
+                                      .watch<SettingsProvider>()
+                                      .searchEnabled ||
+                                  builtinSearchActive,
+                              onToggleSearch: (enabled) {
+                                context
+                                    .read<SettingsProvider>()
+                                    .setSearchEnabled(enabled);
+                              },
+                              onSelectModel: () =>
+                                  showModelSelectSheet(context),
+                              onLongPressSelectModel: () {
+                                Navigator.of(context).push(
+                                  MaterialPageRoute(
+                                    builder: (_) => const ProvidersPage(),
+                                  ),
+                                );
+                              },
+                              onOpenMcp: () {
+                                final a = context
+                                    .read<AssistantProvider>()
+                                    .currentAssistant;
+                                if (a != null) {
+                                  try {
+                                    if (Platform.isMacOS ||
+                                        Platform.isWindows ||
+                                        Platform.isLinux) {
+                                      showDesktopMcpServersPopover(
+                                        context,
+                                        anchorKey: _inputBarKey,
+                                        assistantId: a.id,
+                                      );
+                                    } else {
+                                      showAssistantMcpSheet(
+                                        context,
+                                        assistantId: a.id,
+                                      );
+                                    }
+                                  } catch (_) {
+                                    showAssistantMcpSheet(
+                                      context,
+                                      assistantId: a.id,
+                                    );
+                                  }
+                                }
+                              },
+                              onLongPressMcp: () {
+                                Navigator.of(context).push(
+                                  MaterialPageRoute(
+                                    builder: (_) => const McpPage(),
+                                  ),
+                                );
+                              },
+                              onStop: _cancelStreaming,
+                              modelIcon:
+                                  (settings.showModelIcon &&
+                                      ((a?.chatModelProvider ??
+                                              settings.currentModelProvider) !=
+                                          null) &&
+                                      ((a?.chatModelId ??
+                                              settings.currentModelId) !=
+                                          null))
+                                  ? _CurrentModelIcon(
+                                      providerKey:
+                                          a?.chatModelProvider ??
+                                          settings.currentModelProvider,
+                                      modelId:
+                                          a?.chatModelId ??
+                                          settings.currentModelId,
+                                      size: 40,
+                                      withBackground: true,
+                                      backgroundColor: Colors.transparent,
+                                    )
+                                  : null,
+                              focusNode: _inputFocus,
+                              controller: _inputController,
+                              mediaController: _mediaController,
+                              onConfigureReasoning: () async {
+                                final assistant = context
+                                    .read<AssistantProvider>()
+                                    .currentAssistant;
+                                if (assistant != null) {
+                                  if (assistant.thinkingBudget != null) {
+                                    context
+                                        .read<SettingsProvider>()
+                                        .setThinkingBudget(
+                                          assistant.thinkingBudget,
+                                        );
+                                  }
+                                  await _openReasoningSettings();
+                                  final chosen = context
+                                      .read<SettingsProvider>()
+                                      .thinkingBudget;
+                                  await context
+                                      .read<AssistantProvider>()
+                                      .updateAssistant(
+                                        assistant.copyWith(
+                                          thinkingBudget: chosen,
+                                        ),
+                                      );
+                                }
+                              },
+                              reasoningActive: _isReasoningEnabled(
+                                (context
+                                        .watch<AssistantProvider>()
+                                        .currentAssistant
+                                        ?.thinkingBudget) ??
+                                    settings.thinkingBudget,
+                              ),
+                              supportsReasoning: (pk != null && mid != null)
+                                  ? _isReasoningModel(pk, mid)
+                                  : false,
+                              onOpenSearch: _openSearchSettings,
+                              onSend: (text) {
+                                _sendMessage(text);
+                                _inputController.clear();
+                                // Keep focus on desktop; only dismiss on mobile to hide soft keyboard
+                                if (Platform.isAndroid || Platform.isIOS) {
+                                  _dismissKeyboard();
+                                } else {
+                                  _inputFocus.requestFocus();
+                                }
+                              },
+                              loading: _isCurrentConversationLoading,
+                              showMcpButton: (() {
+                                final pk2 =
+                                    a?.chatModelProvider ??
+                                    settings.currentModelProvider;
+                                final mid3 =
+                                    a?.chatModelId ?? settings.currentModelId;
+                                if (pk2 == null || mid3 == null) return false;
+                                return _isToolModel(pk2, mid3) &&
+                                    context
+                                        .watch<McpProvider>()
+                                        .servers
+                                        .isNotEmpty;
+                              })(),
+                              mcpActive: (() {
+                                final a = context
+                                    .watch<AssistantProvider>()
+                                    .currentAssistant;
+                                final connected = context
+                                    .watch<McpProvider>()
+                                    .connectedServers;
+                                final selected =
+                                    a?.mcpServerIds ?? const <String>[];
+                                if (selected.isEmpty || connected.isEmpty)
+                                  return false;
+                                return connected.any(
+                                  (s) => selected.contains(s.id),
+                                );
+                              })(),
+                              showQuickPhraseButton: (() {
+                                final assistant = context
+                                    .watch<AssistantProvider>()
+                                    .currentAssistant;
+                                final quickPhraseProvider = context
+                                    .watch<QuickPhraseProvider>();
+                                final globalCount =
+                                    quickPhraseProvider.globalPhrases.length;
+                                final assistantCount = assistant != null
+                                    ? quickPhraseProvider
+                                          .getForAssistant(assistant.id)
+                                          .length
+                                    : 0;
+                                return (globalCount + assistantCount) > 0;
+                              })(),
+                              onQuickPhrase: _showQuickPhraseMenu,
+                              onLongPressQuickPhrase: () {
+                                Navigator.of(context).push(
+                                  MaterialPageRoute(
+                                    builder: (_) => const QuickPhrasesPage(),
+                                  ),
+                                );
+                              },
+                            );
                           },
                         ),
                       ),
                     ),
+                  ],
+                ),
+              ),
+
+              // // iOS-style blur/fade effect above input area
+              // Positioned(
+              //   left: 0,
+              //   right: 0,
+              //   bottom: _inputBarHeight,
+              //   child: IgnorePointer(
+              //     child: Container(
+              //       height: 20,
+              //       decoration: BoxDecoration(
+              //         gradient: LinearGradient(
+              //           begin: Alignment.topCenter,
+              //           end: Alignment.bottomCenter,
+              //           colors: [
+              //             Theme.of(context).colorScheme.background.withOpacity(0.0),
+              //             Theme.of(context).colorScheme.background.withOpacity(0.8),
+              //             Theme.of(context).colorScheme.background.withOpacity(1.0),
+              //           ],
+              //           stops: const [0.0, 0.6, 1.0],
+              //         ),
+              //       ),
+              //     ),
+              //   ),
+              // ),
+
+              // Inline tools sheet removed; replaced by modal bottom sheet
+
+              // Selection toolbar overlay (above input bar) with iOS glass capsule + animations
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: SafeArea(
+                  top: false,
+                  child: Padding(
+                    // Move higher: 72 + 12 + 38
+                    padding: const EdgeInsets.only(bottom: 122),
+                    child: _AnimatedSelectionBar(
+                      visible: _selecting,
+                      child: _SelectionToolbar(
+                        onCancel: () {
+                          setState(() {
+                            _selecting = false;
+                            _selectedItems.clear();
+                          });
+                        },
+                        onConfirm: () async {
+                          final convo = _currentConversation;
+                          if (convo == null) return;
+                          final collapsed = _collapseVersions(_messages);
+                          final selected = <ChatMessage>[];
+                          for (final m in collapsed) {
+                            if (_selectedItems.contains(m.id)) selected.add(m);
+                          }
+                          if (selected.isEmpty) {
+                            final l10n = AppLocalizations.of(context)!;
+                            showAppSnackBar(
+                              context,
+                              message: l10n.homePageSelectMessagesToShare,
+                              type: NotificationType.info,
+                            );
+                            return;
+                          }
+                          setState(() {
+                            _selecting = false;
+                          });
+                          await showChatExportSheet(
+                            context,
+                            conversation: convo,
+                            selectedMessages: selected,
+                          );
+                          if (mounted)
+                            setState(() {
+                              _selectedItems.clear();
+                            });
+                        },
+                      ),
+                    ),
                   ),
                 ),
+              ),
 
-                // Scroll-to-bottom button
-                Builder(builder: (context) {
-                  final showSetting = context.watch<SettingsProvider>().showMessageNavButtons;
-                  if (!showSetting || _messages.isEmpty) return const SizedBox.shrink();
+              // Scroll-to-bottom button (bottom-right, above input bar)
+              Builder(
+                builder: (context) {
+                  final showSetting = context
+                      .watch<SettingsProvider>()
+                      .showMessageNavButtons;
+                  // Hide nav button in brand-new chats with no messages
+                  if (!showSetting || _messages.isEmpty)
+                    return const SizedBox.shrink();
                   final cs = Theme.of(context).colorScheme;
-                  final isDark = Theme.of(context).brightness == Brightness.dark;
+                  final isDark =
+                      Theme.of(context).brightness == Brightness.dark;
                   final bottomOffset = _inputBarHeight + 12;
                   return Align(
                     alignment: Alignment.bottomRight,
                     child: SafeArea(
                       top: false,
-                      bottom: false,
+                      bottom:
+                          false, // avoid double bottom inset so button hugs input bar
                       child: IgnorePointer(
                         ignoring: !_showJumpToBottom,
                         child: AnimatedScale(
@@ -5432,10 +5730,16 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                             curve: Curves.easeOutCubic,
                             opacity: _showJumpToBottom ? 1 : 0,
                             child: Padding(
-                              padding: EdgeInsets.only(right: 16, bottom: bottomOffset),
+                              padding: EdgeInsets.only(
+                                right: 16,
+                                bottom: bottomOffset,
+                              ),
                               child: ClipOval(
                                 child: BackdropFilter(
-                                  filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+                                  filter: ui.ImageFilter.blur(
+                                    sigmaX: 14,
+                                    sigmaY: 14,
+                                  ),
                                   child: Container(
                                     decoration: BoxDecoration(
                                       color: isDark
@@ -5445,7 +5749,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                                       border: Border.all(
                                         color: isDark
                                             ? Colors.white.withOpacity(0.10)
-                                            : Theme.of(context).colorScheme.outline.withOpacity(0.20),
+                                            : Theme.of(context)
+                                                  .colorScheme
+                                                  .outline
+                                                  .withOpacity(0.20),
                                         width: 1,
                                       ),
                                     ),
@@ -5456,11 +5763,13 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                                         customBorder: const CircleBorder(),
                                         onTap: _forceScrollToBottom,
                                         child: Padding(
-                                          padding: const EdgeInsets.all(8),
+                                          padding: const EdgeInsets.all(6),
                                           child: Icon(
                                             Lucide.ChevronDown,
-                                            size: 18,
-                                            color: isDark ? Colors.white : Colors.black87,
+                                            size: 16,
+                                            color: isDark
+                                                ? Colors.white
+                                                : Colors.black87,
                                           ),
                                         ),
                                       ),
@@ -5474,14 +5783,24 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                       ),
                     ),
                   );
-                }),
+                },
+              ),
 
-                // Scroll-to-previous-question button
-                Builder(builder: (context) {
-                  final showSetting = context.watch<SettingsProvider>().showMessageNavButtons;
-                  if (!showSetting || _messages.isEmpty) return const SizedBox.shrink();
-                  final isDark = Theme.of(context).brightness == Brightness.dark;
-                  final bottomOffset = _inputBarHeight + 12 + 52;
+              // Scroll-to-previous-question button (stacked above the bottom button)
+              Builder(
+                builder: (context) {
+                  final showSetting = context
+                      .watch<SettingsProvider>()
+                      .showMessageNavButtons;
+                  if (!showSetting || _messages.isEmpty)
+                    return const SizedBox.shrink();
+                  final isDark =
+                      Theme.of(context).brightness == Brightness.dark;
+                  final bottomOffset =
+                      _inputBarHeight +
+                      12 +
+                      52; // place above the bottom button with gap
+                  // Visibility follows the same logic as the bottom button (hide at bottom)
                   final showUp = _showJumpToBottom;
                   return Align(
                     alignment: Alignment.bottomRight,
@@ -5499,10 +5818,16 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                             curve: Curves.easeOutCubic,
                             opacity: showUp ? 1 : 0,
                             child: Padding(
-                              padding: EdgeInsets.only(right: 16, bottom: bottomOffset),
+                              padding: EdgeInsets.only(
+                                right: 16,
+                                bottom: bottomOffset,
+                              ),
                               child: ClipOval(
                                 child: BackdropFilter(
-                                  filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+                                  filter: ui.ImageFilter.blur(
+                                    sigmaX: 14,
+                                    sigmaY: 14,
+                                  ),
                                   child: Container(
                                     decoration: BoxDecoration(
                                       color: isDark
@@ -5512,7 +5837,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                                       border: Border.all(
                                         color: isDark
                                             ? Colors.white.withOpacity(0.10)
-                                            : Theme.of(context).colorScheme.outline.withOpacity(0.20),
+                                            : Theme.of(context)
+                                                  .colorScheme
+                                                  .outline
+                                                  .withOpacity(0.20),
                                         width: 1,
                                       ),
                                     ),
@@ -5523,11 +5851,13 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                                         customBorder: const CircleBorder(),
                                         onTap: _jumpToPreviousQuestion,
                                         child: Padding(
-                                          padding: const EdgeInsets.all(8),
+                                          padding: const EdgeInsets.all(6),
                                           child: Icon(
                                             Lucide.ChevronUp,
-                                            size: 18,
-                                            color: isDark ? Colors.white : Colors.black87,
+                                            size: 16,
+                                            color: isDark
+                                                ? Colors.white
+                                                : Colors.black87,
                                           ),
                                         ),
                                       ),
@@ -5541,16 +5871,2013 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                       ),
                     ),
                   );
-                }),
-              ],
-            )),
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTabletLayout(
+    BuildContext context, {
+    required String title,
+    required String? providerName,
+    required String? modelDisplay,
+    required ColorScheme cs,
+  }) {
+    final bool _isDesktop =
+        defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.windows ||
+        defaultTargetPlatform == TargetPlatform.linux;
+    if (_isDesktop && !_desktopUiInited) {
+      _desktopUiInited = true;
+      try {
+        final sp = context.read<SettingsProvider>();
+        _embeddedSidebarWidth = sp.desktopSidebarWidth.clamp(
+          _sidebarMinWidth,
+          _sidebarMaxWidth,
+        );
+        _tabletSidebarOpen = sp.desktopSidebarOpen;
+      } catch (_) {}
+    }
+    return Stack(
+      children: [
+        Positioned.fill(child: _buildAssistantBackground(context)),
+        SizedBox.expand(
+          child: Row(
+            children: [
+              _buildTabletSidebar(context),
+              if (_isDesktop)
+                _SidebarResizeHandle(
+                  visible: _tabletSidebarOpen,
+                  onDrag: (dx) {
+                    setState(() {
+                      _embeddedSidebarWidth = (_embeddedSidebarWidth + dx)
+                          .clamp(_sidebarMinWidth, _sidebarMaxWidth);
+                    });
+                  },
+                  onDragEnd: () {
+                    try {
+                      context.read<SettingsProvider>().setDesktopSidebarWidth(
+                        _embeddedSidebarWidth,
+                      );
+                    } catch (_) {}
+                  },
+                )
+              else
+                AnimatedContainer(
+                  duration: _sidebarAnimDuration,
+                  curve: _sidebarAnimCurve,
+                  width: _tabletSidebarOpen ? 0.6 : 0,
+                  child: _tabletSidebarOpen
+                      ? VerticalDivider(
+                          width: 0.6,
+                          thickness: 0.5,
+                          color: cs.outlineVariant.withOpacity(0.20),
+                        )
+                      : const SizedBox.shrink(),
+                ),
+              Expanded(
+                child: Scaffold(
+                  key: _scaffoldKey,
+                  resizeToAvoidBottomInset: true,
+                  extendBodyBehindAppBar: true,
+                  backgroundColor: Colors.transparent,
+                  appBar: AppBar(
+                    centerTitle: false,
+                    systemOverlayStyle:
+                        (Theme.of(context).brightness == Brightness.dark)
+                        ? const SystemUiOverlayStyle(
+                            statusBarColor: Colors.transparent,
+                            statusBarIconBrightness: Brightness.light,
+                            statusBarBrightness: Brightness.dark,
+                          )
+                        : const SystemUiOverlayStyle(
+                            statusBarColor: Colors.transparent,
+                            statusBarIconBrightness: Brightness.dark,
+                            statusBarBrightness: Brightness.light,
+                          ),
+                    backgroundColor: Colors.transparent,
+                    surfaceTintColor: Colors.transparent,
+                    elevation: 0,
+                    scrolledUnderElevation: 0,
+                    leading: IosIconButton(
+                      size: 20,
+                      padding: const EdgeInsets.all(8),
+                      minSize: 40,
+                      builder: (color) => SvgPicture.asset(
+                        'assets/icons/list.svg',
+                        width: 14,
+                        height: 14,
+                        colorFilter: ColorFilter.mode(color, BlendMode.srcIn),
+                      ),
+                      onTap: _toggleTabletSidebar,
+                    ),
+                    titleSpacing: 2,
+                    title: Builder(
+                      builder: (context) {
+                        final isDark =
+                            Theme.of(context).brightness == Brightness.dark;
+                        final bool isDesktop =
+                            defaultTargetPlatform == TargetPlatform.macOS ||
+                            defaultTargetPlatform == TargetPlatform.windows ||
+                            defaultTargetPlatform == TargetPlatform.linux;
+                        // Desktop: title and model chip in a single row; Tablet can keep same for consistency
+                        final String? brandAsset =
+                            (modelDisplay != null
+                                ? (BrandAssets.assetForName(modelDisplay))
+                                : null) ??
+                            (providerName != null
+                                ? BrandAssets.assetForName(providerName!)
+                                : null);
+
+                        Widget? capsule;
+                        String? capsuleLabel;
+                        if (providerName != null && modelDisplay != null) {
+                          final showProv = context
+                              .watch<SettingsProvider>()
+                              .showProviderInModelCapsule;
+                          capsuleLabel = showProv
+                              ? '$modelDisplay | $providerName'
+                              : '$modelDisplay';
+                          final Widget brandIcon = AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 200),
+                            transitionBuilder: (child, anim) => FadeTransition(
+                              opacity: anim,
+                              child: ScaleTransition(scale: anim, child: child),
+                            ),
+                            child: (brandAsset != null)
+                                ? (brandAsset.endsWith('.svg')
+                                      ? SvgPicture.asset(
+                                          brandAsset,
+                                          width: 16,
+                                          height: 16,
+                                          key: ValueKey('brand:$brandAsset'),
+                                        )
+                                      : Image.asset(
+                                          brandAsset,
+                                          width: 16,
+                                          height: 16,
+                                          key: ValueKey('brand:$brandAsset'),
+                                        ))
+                                : Icon(
+                                    Lucide.Boxes,
+                                    size: 16,
+                                    color: cs.onSurface.withOpacity(0.7),
+                                    key: const ValueKey('brand:default'),
+                                  ),
+                          );
+
+                          capsule = IosCardPress(
+                            borderRadius: BorderRadius.circular(20),
+                            // baseColor: isDark ? Colors.white12 : Colors.grey.shade200,
+                            baseColor: Colors.transparent,
+                            // AnimatedContainer inside IosCardPress will animate color on hover/press
+                            // We wrap the content in AnimatedSize to animate width changes
+                            pressedBlendStrength: isDark ? 0.18 : 0.12,
+                            padding: EdgeInsets.zero,
+                            onTap: () => showModelSelectSheet(context),
+                            child: AnimatedSize(
+                              duration: const Duration(milliseconds: 200),
+                              curve: Curves.easeOutCubic,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    brandIcon,
+                                    const SizedBox(width: 6),
+                                    // Allow label to ellipsize within the chip
+                                    Flexible(
+                                      child: AnimatedTextSwap(
+                                        text: capsuleLabel!,
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          height: 1.1,
+                                          color: isDark
+                                              ? Colors.white.withOpacity(0.92)
+                                              : cs.onSurface.withOpacity(0.9),
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        }
+
+                        // Primary header row: title expands, capsule stays close to title's right side
+                        final row = Row(
+                          mainAxisSize: MainAxisSize.max,
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            // Title expands and ellipsizes as needed
+                            Flexible(
+                              fit: FlexFit.loose,
+                              child: AnimatedSize(
+                                duration: const Duration(milliseconds: 220),
+                                curve: Curves.easeOutCubic,
+                                child: AnimatedTextSwap(
+                                  text: title,
+                                  style: const TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
+                            if (capsule != null) ...[
+                              const SizedBox(width: 8),
+                              // Capsule scales down to avoid overflow but stays left-aligned
+                              Flexible(
+                                fit: FlexFit.loose,
+                                child: FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  alignment: Alignment.centerLeft,
+                                  child: AnimatedSwitcher(
+                                    duration: const Duration(milliseconds: 220),
+                                    transitionBuilder: (child, anim) =>
+                                        FadeTransition(
+                                          opacity: anim,
+                                          child: SlideTransition(
+                                            position: Tween<Offset>(
+                                              begin: const Offset(0.06, 0),
+                                              end: Offset.zero,
+                                            ).animate(anim),
+                                            child: child,
+                                          ),
+                                        ),
+                                    child: KeyedSubtree(
+                                      key: ValueKey(
+                                        'cap:${capsuleLabel ?? ''}',
+                                      ),
+                                      child: capsule!,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
+                        );
+
+                        // Left-aligned, vertically centered without manual nudges
+                        return Align(
+                          alignment: Alignment.centerLeft,
+                          child: AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 220),
+                            transitionBuilder: (child, anim) => FadeTransition(
+                              opacity: anim,
+                              child: SlideTransition(
+                                position: Tween<Offset>(
+                                  begin: const Offset(0, 0.08),
+                                  end: Offset.zero,
+                                ).animate(anim),
+                                child: child,
+                              ),
+                            ),
+                            child: KeyedSubtree(
+                              key: ValueKey('hdr:$title|${capsuleLabel ?? ''}'),
+                              child: row,
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                    actions: [
+                      IosIconButton(
+                        size: 20,
+                        padding: const EdgeInsets.all(8),
+                        minSize: 40,
+                        icon: Lucide.MessageCirclePlus,
+                        onTap: () async {
+                          await _createNewConversation();
+                          if (mounted) _forceScrollToBottomSoon();
+                        },
+                      ),
+                      const SizedBox(width: 6),
+                    ],
+                  ),
+                  body: _wrapWithDropTarget(
+                    Stack(
+                      children: [
+                        Padding(
+                          padding: EdgeInsets.only(
+                            top:
+                                kToolbarHeight +
+                                MediaQuery.of(context).padding.top,
+                          ),
+                          child: Align(
+                            alignment: Alignment.topCenter,
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 860),
+                              child: Column(
+                                children: [
+                                  // Message list (add subtle animate on conversation switch)
+                                  Expanded(
+                                    child: FadeTransition(
+                                      opacity: _convoFade,
+                                      child:
+                                          KeyedSubtree(
+                                                key: ValueKey<String>(
+                                                  _currentConversation?.id ??
+                                                      'none',
+                                                ),
+                                                child: (() {
+                                                  final messages =
+                                                      _collapseVersions(
+                                                        _messages,
+                                                      );
+                                                  final Map<
+                                                    String,
+                                                    List<ChatMessage>
+                                                  >
+                                                  byGroup =
+                                                      <
+                                                        String,
+                                                        List<ChatMessage>
+                                                      >{};
+                                                  for (final m in _messages) {
+                                                    final gid =
+                                                        (m.groupId ?? m.id);
+                                                    byGroup
+                                                        .putIfAbsent(
+                                                          gid,
+                                                          () => <ChatMessage>[],
+                                                        )
+                                                        .add(m);
+                                                  }
+                                                  // Map persisted truncateIndex (raw) to collapsed index
+                                                  final int truncRaw =
+                                                      _currentConversation
+                                                          ?.truncateIndex ??
+                                                      -1;
+                                                  int truncCollapsed = -1;
+                                                  if (truncRaw > 0) {
+                                                    final seen = <String>{};
+                                                    final int limit =
+                                                        truncRaw <
+                                                            _messages.length
+                                                        ? truncRaw
+                                                        : _messages.length;
+                                                    int count = 0;
+                                                    for (
+                                                      int i = 0;
+                                                      i < limit;
+                                                      i++
+                                                    ) {
+                                                      final gid0 =
+                                                          (_messages[i]
+                                                              .groupId ??
+                                                          _messages[i].id);
+                                                      if (seen.add(gid0))
+                                                        count++;
+                                                    }
+                                                    truncCollapsed = count - 1;
+                                                  }
+                                                  return ListView.builder(
+                                                    controller:
+                                                        _scrollController,
+                                                    padding:
+                                                        const EdgeInsets.only(
+                                                          bottom: 16,
+                                                          top: 8,
+                                                        ),
+                                                    itemCount: messages.length,
+                                                    keyboardDismissBehavior:
+                                                        ScrollViewKeyboardDismissBehavior
+                                                            .onDrag,
+                                                    itemBuilder: (context, index) {
+                                                      if (index < 0 ||
+                                                          index >=
+                                                              messages.length)
+                                                        return const SizedBox.shrink();
+                                                      final message =
+                                                          messages[index];
+                                                      final r =
+                                                          _reasoning[message
+                                                              .id];
+                                                      final t =
+                                                          _translations[message
+                                                              .id];
+                                                      final chatScale = context
+                                                          .watch<
+                                                            SettingsProvider
+                                                          >()
+                                                          .chatFontScale;
+                                                      final assistant = context
+                                                          .watch<
+                                                            AssistantProvider
+                                                          >()
+                                                          .currentAssistant;
+                                                      final useAssist =
+                                                          assistant
+                                                              ?.useAssistantAvatar ==
+                                                          true;
+                                                      final l10n =
+                                                          AppLocalizations.of(
+                                                            context,
+                                                          )!;
+                                                      final showDivider =
+                                                          truncCollapsed >= 0 &&
+                                                          index ==
+                                                              truncCollapsed;
+                                                      final cs = Theme.of(
+                                                        context,
+                                                      ).colorScheme;
+                                                      final label = l10n
+                                                          .homePageClearContext;
+                                                      final divider = Row(
+                                                        children: [
+                                                          Expanded(
+                                                            child: Divider(
+                                                              color: cs
+                                                                  .outlineVariant
+                                                                  .withOpacity(
+                                                                    0.6,
+                                                                  ),
+                                                              height: 1,
+                                                              thickness: 1,
+                                                            ),
+                                                          ),
+                                                          Padding(
+                                                            padding:
+                                                                const EdgeInsets.symmetric(
+                                                                  horizontal:
+                                                                      10,
+                                                                ),
+                                                            child: Text(
+                                                              label,
+                                                              style: TextStyle(
+                                                                fontSize: 12,
+                                                                color: cs
+                                                                    .onSurface
+                                                                    .withOpacity(
+                                                                      0.6,
+                                                                    ),
+                                                              ),
+                                                            ),
+                                                          ),
+                                                          Expanded(
+                                                            child: Divider(
+                                                              color: cs
+                                                                  .outlineVariant
+                                                                  .withOpacity(
+                                                                    0.6,
+                                                                  ),
+                                                              height: 1,
+                                                              thickness: 1,
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      );
+                                                      final gid =
+                                                          (message.groupId ??
+                                                          message.id);
+                                                      final vers =
+                                                          (byGroup[gid] ??
+                                                                  const <
+                                                                    ChatMessage
+                                                                  >[])
+                                                              .toList()
+                                                            ..sort(
+                                                              (a, b) => a
+                                                                  .version
+                                                                  .compareTo(
+                                                                    b.version,
+                                                                  ),
+                                                            );
+                                                      final selectedIdx =
+                                                          _versionSelections[gid] ??
+                                                          (vers.isNotEmpty
+                                                              ? vers.length - 1
+                                                              : 0);
+                                                      final total = vers.length;
+                                                      final showMsgNav = context
+                                                          .watch<
+                                                            SettingsProvider
+                                                          >()
+                                                          .showMessageNavButtons;
+                                                      final effectiveTotal =
+                                                          showMsgNav
+                                                          ? total
+                                                          : 1;
+                                                      final effectiveIndex =
+                                                          showMsgNav
+                                                          ? selectedIdx
+                                                          : 0;
+
+                                                      return Column(
+                                                        key: _keyForMessage(
+                                                          message.id,
+                                                        ),
+                                                        mainAxisSize:
+                                                            MainAxisSize.min,
+                                                        children: [
+                                                          Row(
+                                                            crossAxisAlignment:
+                                                                CrossAxisAlignment
+                                                                    .start,
+                                                            children: [
+                                                              if (_selecting &&
+                                                                  (message.role ==
+                                                                          'user' ||
+                                                                      message.role ==
+                                                                          'assistant'))
+                                                                Padding(
+                                                                  padding:
+                                                                      const EdgeInsets.only(
+                                                                        left:
+                                                                            10,
+                                                                        right:
+                                                                            6,
+                                                                      ),
+                                                                  child: IosCheckbox(
+                                                                    value: _selectedItems
+                                                                        .contains(
+                                                                          message
+                                                                              .id,
+                                                                        ),
+                                                                    onChanged: (v) {
+                                                                      setState(() {
+                                                                        if (v) {
+                                                                          _selectedItems.add(
+                                                                            message.id,
+                                                                          );
+                                                                        } else {
+                                                                          _selectedItems.remove(
+                                                                            message.id,
+                                                                          );
+                                                                        }
+                                                                      });
+                                                                    },
+                                                                  ),
+                                                                ),
+                                                              Expanded(
+                                                                child: MediaQuery(
+                                                                  data: MediaQuery.of(context).copyWith(
+                                                                    textScaleFactor:
+                                                                        MediaQuery.of(
+                                                                          context,
+                                                                        ).textScaleFactor *
+                                                                        chatScale,
+                                                                  ),
+                                                                  child: ChatMessageWidget(
+                                                                    message:
+                                                                        message,
+                                                                    versionIndex:
+                                                                        effectiveIndex,
+                                                                    versionCount:
+                                                                        effectiveTotal,
+                                                                    onPrevVersion:
+                                                                        (showMsgNav &&
+                                                                            selectedIdx >
+                                                                                0)
+                                                                        ? () async {
+                                                                            final next =
+                                                                                selectedIdx -
+                                                                                1;
+                                                                            _versionSelections[gid] =
+                                                                                next;
+                                                                            await _chatService.setSelectedVersion(
+                                                                              _currentConversation!.id,
+                                                                              gid,
+                                                                              next,
+                                                                            );
+                                                                            if (mounted)
+                                                                              setState(
+                                                                                () {},
+                                                                              );
+                                                                          }
+                                                                        : null,
+                                                                    onNextVersion:
+                                                                        (showMsgNav &&
+                                                                            selectedIdx <
+                                                                                total - 1)
+                                                                        ? () async {
+                                                                            final next =
+                                                                                selectedIdx +
+                                                                                1;
+                                                                            _versionSelections[gid] =
+                                                                                next;
+                                                                            await _chatService.setSelectedVersion(
+                                                                              _currentConversation!.id,
+                                                                              gid,
+                                                                              next,
+                                                                            );
+                                                                            if (mounted)
+                                                                              setState(
+                                                                                () {},
+                                                                              );
+                                                                          }
+                                                                        : null,
+                                                                    modelIcon:
+                                                                        (!useAssist &&
+                                                                            message.role ==
+                                                                                'assistant' &&
+                                                                            message.providerId !=
+                                                                                null &&
+                                                                            message.modelId !=
+                                                                                null)
+                                                                        ? _CurrentModelIcon(
+                                                                            providerKey:
+                                                                                message.providerId,
+                                                                            modelId:
+                                                                                message.modelId,
+                                                                            size:
+                                                                                30,
+                                                                          )
+                                                                        : null,
+                                                                    showModelIcon:
+                                                                        useAssist
+                                                                        ? false
+                                                                        : context
+                                                                              .watch<
+                                                                                SettingsProvider
+                                                                              >()
+                                                                              .showModelIcon,
+                                                                    useAssistantAvatar:
+                                                                        useAssist &&
+                                                                        message.role ==
+                                                                            'assistant',
+                                                                    assistantName:
+                                                                        useAssist
+                                                                        ? (assistant?.name ??
+                                                                              'Assistant')
+                                                                        : null,
+                                                                    assistantAvatar:
+                                                                        useAssist
+                                                                        ? (assistant?.avatar ??
+                                                                              '')
+                                                                        : null,
+                                                                    showUserAvatar: context
+                                                                        .watch<
+                                                                          SettingsProvider
+                                                                        >()
+                                                                        .showUserAvatar,
+                                                                    showTokenStats: context
+                                                                        .watch<
+                                                                          SettingsProvider
+                                                                        >()
+                                                                        .showTokenStats,
+                                                                    reasoningText:
+                                                                        (message.role ==
+                                                                            'assistant')
+                                                                        ? (r?.text ??
+                                                                              '')
+                                                                        : null,
+                                                                    reasoningExpanded:
+                                                                        (message.role ==
+                                                                            'assistant')
+                                                                        ? (r?.expanded ??
+                                                                              false)
+                                                                        : false,
+                                                                    reasoningLoading:
+                                                                        (message.role ==
+                                                                            'assistant')
+                                                                        ? (r?.finishedAt ==
+                                                                                  null &&
+                                                                              (r?.text.isNotEmpty ==
+                                                                                  true))
+                                                                        : false,
+                                                                    reasoningStartAt:
+                                                                        (message.role ==
+                                                                            'assistant')
+                                                                        ? r?.startAt
+                                                                        : null,
+                                                                    reasoningFinishedAt:
+                                                                        (message.role ==
+                                                                            'assistant')
+                                                                        ? r?.finishedAt
+                                                                        : null,
+                                                                    onToggleReasoning:
+                                                                        (message.role ==
+                                                                                'assistant' &&
+                                                                            r !=
+                                                                                null)
+                                                                        ? () {
+                                                                            setState(() {
+                                                                              r.expanded = !r.expanded;
+                                                                            });
+                                                                          }
+                                                                        : null,
+                                                                    translationExpanded:
+                                                                        t?.expanded ??
+                                                                        true,
+                                                                    onToggleTranslation:
+                                                                        (message.translation !=
+                                                                                null &&
+                                                                            message.translation!.isNotEmpty &&
+                                                                            t !=
+                                                                                null)
+                                                                        ? () {
+                                                                            setState(() {
+                                                                              t.expanded = !t.expanded;
+                                                                            });
+                                                                          }
+                                                                        : null,
+                                                                    onRegenerate:
+                                                                        message.role ==
+                                                                            'assistant'
+                                                                        ? () {
+                                                                            _regenerateAtMessage(
+                                                                              message,
+                                                                            );
+                                                                          }
+                                                                        : null,
+                                                                    onResend:
+                                                                        message.role ==
+                                                                            'user'
+                                                                        ? () {
+                                                                            _regenerateAtMessage(
+                                                                              message,
+                                                                            );
+                                                                          }
+                                                                        : null,
+                                                                    onTranslate:
+                                                                        message.role ==
+                                                                            'assistant'
+                                                                        ? () {
+                                                                            _translateMessage(
+                                                                              message,
+                                                                            );
+                                                                          }
+                                                                        : null,
+                                                                    onSpeak:
+                                                                        message.role ==
+                                                                            'assistant'
+                                                                        ? () async {
+                                                                            final isDesktop =
+                                                                                defaultTargetPlatform ==
+                                                                                    TargetPlatform.macOS ||
+                                                                                defaultTargetPlatform ==
+                                                                                    TargetPlatform.windows ||
+                                                                                defaultTargetPlatform ==
+                                                                                    TargetPlatform.linux;
+                                                                            if (isDesktop) {
+                                                                              final sp = context
+                                                                                  .read<
+                                                                                    SettingsProvider
+                                                                                  >();
+                                                                              final hasNetworkTts =
+                                                                                  sp.ttsServiceSelected >=
+                                                                                      0 &&
+                                                                                  sp.ttsServices.isNotEmpty;
+                                                                              if (!hasNetworkTts) {
+                                                                                showAppSnackBar(
+                                                                                  context,
+                                                                                  message: AppLocalizations.of(
+                                                                                    context,
+                                                                                  )!.desktopTtsPleaseAddProvider,
+                                                                                  type: NotificationType.warning,
+                                                                                );
+                                                                                return;
+                                                                              }
+                                                                            }
+                                                                            final tts = context
+                                                                                .read<
+                                                                                  TtsProvider
+                                                                                >();
+                                                                            if (!tts.isSpeaking) {
+                                                                              await tts.speak(
+                                                                                message.content,
+                                                                              );
+                                                                            } else {
+                                                                              await tts.stop();
+                                                                            }
+                                                                          }
+                                                                        : null,
+                                                                    onEdit:
+                                                                        message.role ==
+                                                                            'user'
+                                                                        ? () async {
+                                                                            final isDesktop =
+                                                                                defaultTargetPlatform ==
+                                                                                    TargetPlatform.macOS ||
+                                                                                defaultTargetPlatform ==
+                                                                                    TargetPlatform.windows ||
+                                                                                defaultTargetPlatform ==
+                                                                                    TargetPlatform.linux;
+                                                                            final edited =
+                                                                                isDesktop
+                                                                                ? await showMessageEditDesktopDialog(
+                                                                                    context,
+                                                                                    message: message,
+                                                                                  )
+                                                                                : await showMessageEditSheet(
+                                                                                    context,
+                                                                                    message: message,
+                                                                                  );
+                                                                            if (edited !=
+                                                                                null) {
+                                                                              final newMsg = await _chatService.appendMessageVersion(
+                                                                                messageId: message.id,
+                                                                                content: edited,
+                                                                              );
+                                                                              if (!mounted)
+                                                                                return;
+                                                                              setState(
+                                                                                () {
+                                                                                  if (newMsg !=
+                                                                                      null) {
+                                                                                    _messages.add(
+                                                                                      newMsg,
+                                                                                    );
+                                                                                    final gid2 =
+                                                                                        (newMsg.groupId ??
+                                                                                        newMsg.id);
+                                                                                    _versionSelections[gid2] = newMsg.version;
+                                                                                  }
+                                                                                },
+                                                                              );
+                                                                              try {
+                                                                                if (newMsg !=
+                                                                                        null &&
+                                                                                    _currentConversation !=
+                                                                                        null) {
+                                                                                  final gid2 =
+                                                                                      (newMsg.groupId ??
+                                                                                      newMsg.id);
+                                                                                  await _chatService.setSelectedVersion(
+                                                                                    _currentConversation!.id,
+                                                                                    gid2,
+                                                                                    newMsg.version,
+                                                                                  );
+                                                                                }
+                                                                              } catch (
+                                                                                _
+                                                                              ) {}
+                                                                            }
+                                                                          }
+                                                                        : null,
+                                                                    onDelete:
+                                                                        message.role ==
+                                                                            'user'
+                                                                        ? () async {
+                                                                            final l10n = AppLocalizations.of(
+                                                                              context,
+                                                                            )!;
+                                                                            final confirm =
+                                                                                await showDialog<
+                                                                                  bool
+                                                                                >(
+                                                                                  context: context,
+                                                                                  builder:
+                                                                                      (
+                                                                                        ctx,
+                                                                                      ) => AlertDialog(
+                                                                                        title: Text(
+                                                                                          l10n.homePageDeleteMessage,
+                                                                                        ),
+                                                                                        content: Text(
+                                                                                          l10n.homePageDeleteMessageConfirm,
+                                                                                        ),
+                                                                                        actions: [
+                                                                                          TextButton(
+                                                                                            onPressed: () =>
+                                                                                                Navigator.of(
+                                                                                                  ctx,
+                                                                                                ).pop(
+                                                                                                  false,
+                                                                                                ),
+                                                                                            child: Text(
+                                                                                              l10n.homePageCancel,
+                                                                                            ),
+                                                                                          ),
+                                                                                          TextButton(
+                                                                                            onPressed: () =>
+                                                                                                Navigator.of(
+                                                                                                  ctx,
+                                                                                                ).pop(
+                                                                                                  true,
+                                                                                                ),
+                                                                                            child: Text(
+                                                                                              l10n.homePageDelete,
+                                                                                              style: const TextStyle(
+                                                                                                color: Colors.red,
+                                                                                              ),
+                                                                                            ),
+                                                                                          ),
+                                                                                        ],
+                                                                                      ),
+                                                                                );
+                                                                            if (confirm ==
+                                                                                true) {
+                                                                              final id = message.id;
+                                                                              setState(
+                                                                                () {
+                                                                                  _messages.removeWhere(
+                                                                                    (
+                                                                                      m,
+                                                                                    ) =>
+                                                                                        m.id ==
+                                                                                        id,
+                                                                                  );
+                                                                                  _reasoning.remove(
+                                                                                    id,
+                                                                                  );
+                                                                                  _translations.remove(
+                                                                                    id,
+                                                                                  );
+                                                                                  _toolParts.remove(
+                                                                                    id,
+                                                                                  );
+                                                                                  _reasoningSegments.remove(
+                                                                                    id,
+                                                                                  );
+                                                                                },
+                                                                              );
+                                                                              await _chatService.deleteMessage(
+                                                                                id,
+                                                                              );
+                                                                            }
+                                                                          }
+                                                                        : null,
+                                                                    onMore: () async {
+                                                                      final action = await showMessageMoreSheet(
+                                                                        context,
+                                                                        message,
+                                                                      );
+                                                                      if (!mounted)
+                                                                        return;
+                                                                      if (action ==
+                                                                          MessageMoreAction
+                                                                              .delete) {
+                                                                        final l10n =
+                                                                            AppLocalizations.of(
+                                                                              context,
+                                                                            )!;
+                                                                        final confirm = await showDialog<bool>(
+                                                                          context:
+                                                                              context,
+                                                                          builder: (ctx) => AlertDialog(
+                                                                            title: Text(
+                                                                              l10n.homePageDeleteMessage,
+                                                                            ),
+                                                                            content: Text(
+                                                                              l10n.homePageDeleteMessageConfirm,
+                                                                            ),
+                                                                            actions: [
+                                                                              TextButton(
+                                                                                onPressed: () =>
+                                                                                    Navigator.of(
+                                                                                      ctx,
+                                                                                    ).pop(
+                                                                                      false,
+                                                                                    ),
+                                                                                child: Text(
+                                                                                  l10n.homePageCancel,
+                                                                                ),
+                                                                              ),
+                                                                              TextButton(
+                                                                                onPressed: () =>
+                                                                                    Navigator.of(
+                                                                                      ctx,
+                                                                                    ).pop(
+                                                                                      true,
+                                                                                    ),
+                                                                                child: Text(
+                                                                                  l10n.homePageDelete,
+                                                                                  style: const TextStyle(
+                                                                                    color: Colors.red,
+                                                                                  ),
+                                                                                ),
+                                                                              ),
+                                                                            ],
+                                                                          ),
+                                                                        );
+                                                                        if (confirm ==
+                                                                            true) {
+                                                                          final id =
+                                                                              message.id;
+                                                                          setState(() {
+                                                                            _messages.removeWhere(
+                                                                              (
+                                                                                m,
+                                                                              ) =>
+                                                                                  m.id ==
+                                                                                  id,
+                                                                            );
+                                                                            _reasoning.remove(
+                                                                              id,
+                                                                            );
+                                                                            _translations.remove(
+                                                                              id,
+                                                                            );
+                                                                            _toolParts.remove(
+                                                                              id,
+                                                                            );
+                                                                            _reasoningSegments.remove(
+                                                                              id,
+                                                                            );
+                                                                          });
+                                                                          await _chatService.deleteMessage(
+                                                                            id,
+                                                                          );
+                                                                        }
+                                                                      } else if (action ==
+                                                                          MessageMoreAction
+                                                                              .edit) {
+                                                                        final isDesktop =
+                                                                            defaultTargetPlatform ==
+                                                                                TargetPlatform.macOS ||
+                                                                            defaultTargetPlatform ==
+                                                                                TargetPlatform.windows ||
+                                                                            defaultTargetPlatform ==
+                                                                                TargetPlatform.linux;
+                                                                        final edited =
+                                                                            isDesktop
+                                                                            ? await showMessageEditDesktopDialog(
+                                                                                context,
+                                                                                message: message,
+                                                                              )
+                                                                            : await showMessageEditSheet(
+                                                                                context,
+                                                                                message: message,
+                                                                              );
+                                                                        if (edited !=
+                                                                            null) {
+                                                                          final newMsg = await _chatService.appendMessageVersion(
+                                                                            messageId:
+                                                                                message.id,
+                                                                            content:
+                                                                                edited,
+                                                                          );
+                                                                          if (!mounted)
+                                                                            return;
+                                                                          setState(() {
+                                                                            if (newMsg !=
+                                                                                null) {
+                                                                              _messages.add(
+                                                                                newMsg,
+                                                                              );
+                                                                              final gid =
+                                                                                  (newMsg.groupId ??
+                                                                                  newMsg.id);
+                                                                              _versionSelections[gid] = newMsg.version;
+                                                                            }
+                                                                          });
+                                                                          try {
+                                                                            if (newMsg !=
+                                                                                    null &&
+                                                                                _currentConversation !=
+                                                                                    null) {
+                                                                              final gid =
+                                                                                  (newMsg.groupId ??
+                                                                                  newMsg.id);
+                                                                              await _chatService.setSelectedVersion(
+                                                                                _currentConversation!.id,
+                                                                                gid,
+                                                                                newMsg.version,
+                                                                              );
+                                                                            }
+                                                                          } catch (
+                                                                            _
+                                                                          ) {}
+                                                                        }
+                                                                      } else if (action ==
+                                                                          MessageMoreAction
+                                                                              .fork) {
+                                                                        // Determine included groups up to the message's group (inclusive)
+                                                                        final Map<
+                                                                          String,
+                                                                          int
+                                                                        >
+                                                                        groupFirstIndex =
+                                                                            <
+                                                                              String,
+                                                                              int
+                                                                            >{};
+                                                                        final List<
+                                                                          String
+                                                                        >
+                                                                        groupOrder =
+                                                                            <
+                                                                              String
+                                                                            >[];
+                                                                        for (
+                                                                          int
+                                                                          i = 0;
+                                                                          i <
+                                                                              _messages.length;
+                                                                          i++
+                                                                        ) {
+                                                                          final gid0 =
+                                                                              (_messages[i].groupId ??
+                                                                              _messages[i].id);
+                                                                          if (!groupFirstIndex.containsKey(
+                                                                            gid0,
+                                                                          )) {
+                                                                            groupFirstIndex[gid0] =
+                                                                                i;
+                                                                            groupOrder.add(
+                                                                              gid0,
+                                                                            );
+                                                                          }
+                                                                        }
+                                                                        final targetGroup =
+                                                                            (message.groupId ??
+                                                                            message.id);
+                                                                        final targetOrderIndex =
+                                                                            groupOrder.indexOf(
+                                                                              targetGroup,
+                                                                            );
+                                                                        if (targetOrderIndex >=
+                                                                            0) {
+                                                                          final includeGroups = groupOrder
+                                                                              .take(
+                                                                                targetOrderIndex +
+                                                                                    1,
+                                                                              )
+                                                                              .toSet();
+                                                                          final selected = [
+                                                                            for (final m
+                                                                                in _messages)
+                                                                              if (includeGroups.contains(
+                                                                                m.groupId ??
+                                                                                    m.id,
+                                                                              ))
+                                                                                m,
+                                                                          ];
+                                                                          // Filter version selections to included groups
+                                                                          final sel =
+                                                                              <
+                                                                                String,
+                                                                                int
+                                                                              >{};
+                                                                          for (final gid
+                                                                              in includeGroups) {
+                                                                            final v =
+                                                                                _versionSelections[gid];
+                                                                            if (v !=
+                                                                                null)
+                                                                              sel[gid] = v;
+                                                                          }
+                                                                          final newConvo = await _chatService.forkConversation(
+                                                                            title: _titleForLocale(
+                                                                              context,
+                                                                            ),
+                                                                            assistantId:
+                                                                                _currentConversation?.assistantId,
+                                                                            sourceMessages:
+                                                                                selected,
+                                                                            versionSelections:
+                                                                                sel,
+                                                                          );
+                                                                          // Switch to the new conversation; skip fade on desktop for instant switch
+                                                                          if (!mounted)
+                                                                            return;
+                                                                          if (!_isDesktopPlatform) {
+                                                                            await _convoFadeController.reverse();
+                                                                          }
+                                                                          _chatService.setCurrentConversation(
+                                                                            newConvo.id,
+                                                                          );
+                                                                          final msgs = _chatService.getMessages(
+                                                                            newConvo.id,
+                                                                          );
+                                                                          if (!mounted)
+                                                                            return;
+                                                                          setState(() {
+                                                                            _currentConversation =
+                                                                                newConvo;
+                                                                            _messages = List.of(
+                                                                              msgs,
+                                                                            );
+                                                                            _loadVersionSelections();
+                                                                            _restoreMessageUiState();
+                                                                          });
+                                                                          try {
+                                                                            await WidgetsBinding.instance.endOfFrame;
+                                                                          } catch (
+                                                                            _
+                                                                          ) {}
+                                                                          _scrollToBottom();
+                                                                          if (!_isDesktopPlatform) {
+                                                                            await _convoFadeController.forward();
+                                                                          }
+                                                                        }
+                                                                      } else if (action ==
+                                                                          MessageMoreAction
+                                                                              .share) {
+                                                                        setState(() {
+                                                                          _selecting =
+                                                                              true;
+                                                                          _selectedItems
+                                                                              .clear();
+                                                                          final idx = messages.indexWhere(
+                                                                            (
+                                                                              m,
+                                                                            ) =>
+                                                                                m.id ==
+                                                                                message.id,
+                                                                          );
+                                                                          for (
+                                                                            int
+                                                                            i = 0;
+                                                                            i <=
+                                                                                    idx &&
+                                                                                i <
+                                                                                    messages.length;
+                                                                            i++
+                                                                          ) {
+                                                                            final m =
+                                                                                messages[i];
+                                                                            final enabled0 =
+                                                                                (m.role ==
+                                                                                    'user' ||
+                                                                                m.role ==
+                                                                                    'assistant');
+                                                                            if (enabled0)
+                                                                              _selectedItems.add(
+                                                                                m.id,
+                                                                              );
+                                                                          }
+                                                                        });
+                                                                      } else if (action ==
+                                                                          null) {
+                                                                        // do nothing
+                                                                      } else {
+                                                                        // Select action (legacy string)
+                                                                        setState(() {
+                                                                          _selecting =
+                                                                              true;
+                                                                          _selectedItems.add(
+                                                                            message.id,
+                                                                          );
+                                                                        });
+                                                                      }
+                                                                    },
+                                                                    // Ensure tool call/search/citation cards render on tablets too
+                                                                    toolParts:
+                                                                        message.role ==
+                                                                            'assistant'
+                                                                        ? _toolParts[message
+                                                                              .id]
+                                                                        : null,
+                                                                    reasoningSegments:
+                                                                        message.role ==
+                                                                            'assistant'
+                                                                        ? (() {
+                                                                            final segments =
+                                                                                _reasoningSegments[message.id];
+                                                                            if (segments ==
+                                                                                    null ||
+                                                                                segments.isEmpty)
+                                                                              return null;
+                                                                            return segments
+                                                                                .map(
+                                                                                  (
+                                                                                    s,
+                                                                                  ) => ReasoningSegment(
+                                                                                    text: s.text,
+                                                                                    expanded: s.expanded,
+                                                                                    loading:
+                                                                                        s.finishedAt ==
+                                                                                            null &&
+                                                                                        s.text.isNotEmpty,
+                                                                                    startAt: s.startAt,
+                                                                                    finishedAt: s.finishedAt,
+                                                                                    onToggle: () {
+                                                                                      setState(
+                                                                                        () {
+                                                                                          s.expanded = !s.expanded;
+                                                                                        },
+                                                                                      );
+                                                                                    },
+                                                                                    toolStartIndex: s.toolStartIndex,
+                                                                                  ),
+                                                                                )
+                                                                                .toList();
+                                                                          })()
+                                                                        : null,
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            ],
+                                                          ),
+                                                          if (showDivider)
+                                                            Padding(
+                                                              padding:
+                                                                  const EdgeInsets.symmetric(
+                                                                    vertical: 8,
+                                                                    horizontal:
+                                                                        12,
+                                                                  ),
+                                                              child: divider,
+                                                            ),
+                                                        ],
+                                                      );
+                                                    },
+                                                  );
+                                                })(),
+                                              )
+                                              .animate(
+                                                key: ValueKey(
+                                                  'tab_body_' +
+                                                      (_currentConversation
+                                                              ?.id ??
+                                                          'none'),
+                                                ),
+                                              )
+                                              .fadeIn(
+                                                duration: 200.ms,
+                                                curve: Curves.easeOutCubic,
+                                              ),
+                                      // .slideY(begin: 0.02, end: 0, duration: 240.ms, curve: Curves.easeOutCubic),
+                                    ),
+                                  ),
+
+                                  // Input bar with max width
+                                  NotificationListener<
+                                    SizeChangedLayoutNotification
+                                  >(
+                                    onNotification: (n) {
+                                      WidgetsBinding.instance
+                                          .addPostFrameCallback(
+                                            (_) => _measureInputBar(),
+                                          );
+                                      return false;
+                                    },
+                                    child: SizeChangedLayoutNotifier(
+                                      child: Builder(
+                                        builder: (context) {
+                                          final settings = context
+                                              .watch<SettingsProvider>();
+                                          final ap = context
+                                              .watch<AssistantProvider>();
+                                          final a = ap.currentAssistant;
+                                          final pk =
+                                              a?.chatModelProvider ??
+                                              settings.currentModelProvider;
+                                          final mid =
+                                              a?.chatModelId ??
+                                              settings.currentModelId;
+                                          if (pk != null && mid != null) {
+                                            final supportsTools = _isToolModel(
+                                              pk,
+                                              mid,
+                                            );
+                                            if (!supportsTools &&
+                                                (a?.mcpServerIds.isNotEmpty ??
+                                                    false)) {
+                                              WidgetsBinding.instance
+                                                  .addPostFrameCallback((_) {
+                                                    final aa =
+                                                        ap.currentAssistant;
+                                                    if (aa != null &&
+                                                        aa
+                                                            .mcpServerIds
+                                                            .isNotEmpty) {
+                                                      ap.updateAssistant(
+                                                        aa.copyWith(
+                                                          mcpServerIds:
+                                                              const <String>[],
+                                                        ),
+                                                      );
+                                                    }
+                                                  });
+                                            }
+                                            final supportsReasoning =
+                                                _isReasoningModel(pk, mid);
+                                            if (!supportsReasoning &&
+                                                a != null) {
+                                              final enabledNow =
+                                                  _isReasoningEnabled(
+                                                    a.thinkingBudget ??
+                                                        settings.thinkingBudget,
+                                                  );
+                                              if (enabledNow) {
+                                                WidgetsBinding.instance
+                                                    .addPostFrameCallback((
+                                                      _,
+                                                    ) async {
+                                                      final aa =
+                                                          ap.currentAssistant;
+                                                      if (aa != null) {
+                                                        await ap
+                                                            .updateAssistant(
+                                                              aa.copyWith(
+                                                                thinkingBudget:
+                                                                    0,
+                                                              ),
+                                                            );
+                                                      }
+                                                    });
+                                              }
+                                            }
+                                          }
+                                          final currentProvider =
+                                              a?.chatModelProvider ??
+                                              settings.currentModelProvider;
+                                          final currentModelId =
+                                              a?.chatModelId ??
+                                              settings.currentModelId;
+                                          final cfg = (currentProvider != null)
+                                              ? settings.getProviderConfig(
+                                                  currentProvider,
+                                                )
+                                              : null;
+                                          bool builtinSearchActive = false;
+                                          if (cfg != null &&
+                                              currentModelId != null) {
+                                            final mid2 = currentModelId;
+                                            final isGeminiOfficial =
+                                                cfg.providerType ==
+                                                    ProviderKind.google &&
+                                                (cfg.vertexAI != true);
+                                            final isClaude =
+                                                cfg.providerType ==
+                                                ProviderKind.claude;
+                                            final isOpenAIResponses =
+                                                cfg.providerType ==
+                                                    ProviderKind.openai &&
+                                                (cfg.useResponseApi == true);
+                                            if (isGeminiOfficial ||
+                                                isClaude ||
+                                                isOpenAIResponses) {
+                                              final ov =
+                                                  cfg.modelOverrides[mid2]
+                                                      as Map?;
+                                              final list =
+                                                  (ov?['builtInTools']
+                                                      as List?) ??
+                                                  const <dynamic>[];
+                                              builtinSearchActive = list
+                                                  .map(
+                                                    (e) => e
+                                                        .toString()
+                                                        .toLowerCase(),
+                                                  )
+                                                  .contains('search');
+                                            }
+                                          }
+
+                                          final isDesktop =
+                                              defaultTargetPlatform ==
+                                                  TargetPlatform.macOS ||
+                                              defaultTargetPlatform ==
+                                                  TargetPlatform.windows ||
+                                              defaultTargetPlatform ==
+                                                  TargetPlatform.linux;
+                                          Widget input = ChatInputBar(
+                                            key: _inputBarKey,
+                                            onMore: _toggleTools,
+                                            searchEnabled:
+                                                context
+                                                    .watch<SettingsProvider>()
+                                                    .searchEnabled ||
+                                                builtinSearchActive,
+                                            onToggleSearch: (enabled) {
+                                              context
+                                                  .read<SettingsProvider>()
+                                                  .setSearchEnabled(enabled);
+                                            },
+                                            onSelectModel: () =>
+                                                showModelSelectSheet(context),
+                                            onLongPressSelectModel: () {
+                                              Navigator.of(context).push(
+                                                MaterialPageRoute(
+                                                  builder: (_) =>
+                                                      const ProvidersPage(),
+                                                ),
+                                              );
+                                            },
+                                            onOpenMcp: () {
+                                              final a = context
+                                                  .read<AssistantProvider>()
+                                                  .currentAssistant;
+                                              if (a != null) {
+                                                try {
+                                                  if (Platform.isMacOS ||
+                                                      Platform.isWindows ||
+                                                      Platform.isLinux) {
+                                                    showDesktopMcpServersPopover(
+                                                      context,
+                                                      anchorKey: _inputBarKey,
+                                                      assistantId: a.id,
+                                                    );
+                                                  } else {
+                                                    showAssistantMcpSheet(
+                                                      context,
+                                                      assistantId: a.id,
+                                                    );
+                                                  }
+                                                } catch (_) {
+                                                  showAssistantMcpSheet(
+                                                    context,
+                                                    assistantId: a.id,
+                                                  );
+                                                }
+                                              }
+                                            },
+                                            onLongPressMcp: () {
+                                              Navigator.of(context).push(
+                                                MaterialPageRoute(
+                                                  builder: (_) =>
+                                                      const McpPage(),
+                                                ),
+                                              );
+                                            },
+                                            // Quick Phrase button (tablet): show to the right of MCP
+                                            showQuickPhraseButton: (() {
+                                              final assistant = context
+                                                  .watch<AssistantProvider>()
+                                                  .currentAssistant;
+                                              final quickPhraseProvider =
+                                                  context
+                                                      .watch<
+                                                        QuickPhraseProvider
+                                                      >();
+                                              final globalCount =
+                                                  quickPhraseProvider
+                                                      .globalPhrases
+                                                      .length;
+                                              final assistantCount =
+                                                  assistant != null
+                                                  ? quickPhraseProvider
+                                                        .getForAssistant(
+                                                          assistant.id,
+                                                        )
+                                                        .length
+                                                  : 0;
+                                              return (globalCount +
+                                                      assistantCount) >
+                                                  0;
+                                            })(),
+                                            onQuickPhrase: _showQuickPhraseMenu,
+                                            onLongPressQuickPhrase: () {
+                                              Navigator.of(context).push(
+                                                MaterialPageRoute(
+                                                  builder: (_) =>
+                                                      const QuickPhrasesPage(),
+                                                ),
+                                              );
+                                            },
+                                            showMiniMapButton: true,
+                                            onOpenMiniMap: () async {
+                                              final collapsed =
+                                                  _collapseVersions(_messages);
+                                              String? selectedId;
+                                              try {
+                                                if (Platform.isMacOS ||
+                                                    Platform.isWindows ||
+                                                    Platform.isLinux) {
+                                                  selectedId =
+                                                      await showDesktopMiniMapPopover(
+                                                        context,
+                                                        anchorKey: _inputBarKey,
+                                                        messages: collapsed,
+                                                      );
+                                                } else {
+                                                  selectedId =
+                                                      await showMiniMapSheet(
+                                                        context,
+                                                        collapsed,
+                                                      );
+                                                }
+                                              } catch (_) {
+                                                selectedId =
+                                                    await showMiniMapSheet(
+                                                      context,
+                                                      collapsed,
+                                                    );
+                                              }
+                                              if (selectedId != null &&
+                                                  selectedId.isNotEmpty) {
+                                                await _scrollToMessageId(
+                                                  selectedId,
+                                                );
+                                              }
+                                            },
+                                            onPickCamera: isDesktop
+                                                ? null
+                                                : _onPickCamera,
+                                            onPickPhotos: isDesktop
+                                                ? null
+                                                : _onPickPhotos,
+                                            onUploadFiles: _onPickFiles,
+                                            onToggleLearningMode: () async {
+                                              final enabled =
+                                                  await LearningModeStore.isEnabled();
+                                              await LearningModeStore.setEnabled(
+                                                !enabled,
+                                              );
+                                              if (mounted)
+                                                setState(
+                                                  () => _learningModeEnabled =
+                                                      !enabled,
+                                                );
+                                            },
+                                            onLongPressLearning:
+                                                _showLearningPromptSheet,
+                                            learningModeActive:
+                                                _learningModeEnabled,
+                                            showMoreButton: false,
+                                            onClearContext: _onClearContext,
+                                            onStop: _cancelStreaming,
+                                            modelIcon:
+                                                (settings.showModelIcon &&
+                                                    ((a?.chatModelProvider ??
+                                                            settings
+                                                                .currentModelProvider) !=
+                                                        null) &&
+                                                    ((a?.chatModelId ??
+                                                            settings
+                                                                .currentModelId) !=
+                                                        null))
+                                                ? _CurrentModelIcon(
+                                                    providerKey:
+                                                        a?.chatModelProvider ??
+                                                        settings
+                                                            .currentModelProvider,
+                                                    modelId:
+                                                        a?.chatModelId ??
+                                                        settings.currentModelId,
+                                                    size: 40,
+                                                    withBackground: true,
+                                                    backgroundColor:
+                                                        Colors.transparent,
+                                                  )
+                                                : null,
+                                            focusNode: _inputFocus,
+                                            controller: _inputController,
+                                            mediaController: _mediaController,
+                                            onConfigureReasoning: () async {
+                                              final assistant = context
+                                                  .read<AssistantProvider>()
+                                                  .currentAssistant;
+                                              if (assistant != null) {
+                                                if (assistant.thinkingBudget !=
+                                                    null) {
+                                                  context
+                                                      .read<SettingsProvider>()
+                                                      .setThinkingBudget(
+                                                        assistant
+                                                            .thinkingBudget,
+                                                      );
+                                                }
+                                                await _openReasoningSettings();
+                                                final chosen = context
+                                                    .read<SettingsProvider>()
+                                                    .thinkingBudget;
+                                                await context
+                                                    .read<AssistantProvider>()
+                                                    .updateAssistant(
+                                                      assistant.copyWith(
+                                                        thinkingBudget: chosen,
+                                                      ),
+                                                    );
+                                              }
+                                            },
+                                            reasoningActive:
+                                                _isReasoningEnabled(
+                                                  (context
+                                                          .watch<
+                                                            AssistantProvider
+                                                          >()
+                                                          .currentAssistant
+                                                          ?.thinkingBudget) ??
+                                                      settings.thinkingBudget,
+                                                ),
+                                            supportsReasoning:
+                                                (pk != null && mid != null)
+                                                ? _isReasoningModel(pk, mid)
+                                                : false,
+                                            onOpenSearch: _openSearchSettings,
+                                            onSend: (text) {
+                                              _sendMessage(text);
+                                              _inputController.clear();
+                                              if (Platform.isAndroid ||
+                                                  Platform.isIOS) {
+                                                _dismissKeyboard();
+                                              } else {
+                                                _inputFocus.requestFocus();
+                                              }
+                                            },
+                                            loading:
+                                                _isCurrentConversationLoading,
+                                            showMcpButton: (() {
+                                              final pk2 =
+                                                  a?.chatModelProvider ??
+                                                  settings.currentModelProvider;
+                                              final mid3 =
+                                                  a?.chatModelId ??
+                                                  settings.currentModelId;
+                                              if (pk2 == null || mid3 == null)
+                                                return false;
+                                              return _isToolModel(pk2, mid3) &&
+                                                  context
+                                                      .watch<McpProvider>()
+                                                      .servers
+                                                      .isNotEmpty;
+                                            })(),
+                                            mcpActive: (() {
+                                              final a = context
+                                                  .watch<AssistantProvider>()
+                                                  .currentAssistant;
+                                              final connected = context
+                                                  .watch<McpProvider>()
+                                                  .connectedServers;
+                                              final selected =
+                                                  a?.mcpServerIds ??
+                                                  const <String>[];
+                                              if (selected.isEmpty ||
+                                                  connected.isEmpty)
+                                                return false;
+                                              return connected.any(
+                                                (s) => selected.contains(s.id),
+                                              );
+                                            })(),
+                                          );
+
+                                          input = Center(
+                                            child: ConstrainedBox(
+                                              constraints: const BoxConstraints(
+                                                maxWidth: 800,
+                                              ),
+                                              child: input,
+                                            ),
+                                          );
+                                          return input;
+                                        },
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+
+                        // Selection toolbar overlay (tablet) with iOS glass capsule + animations
+                        Align(
+                          alignment: Alignment.bottomCenter,
+                          child: SafeArea(
+                            top: false,
+                            child: Padding(
+                              // Move higher: 72 + 12 + 38
+                              padding: const EdgeInsets.only(bottom: 122),
+                              child: _AnimatedSelectionBar(
+                                visible: _selecting,
+                                child: _SelectionToolbar(
+                                  onCancel: () {
+                                    setState(() {
+                                      _selecting = false;
+                                      _selectedItems.clear();
+                                    });
+                                  },
+                                  onConfirm: () async {
+                                    final convo = _currentConversation;
+                                    if (convo == null) return;
+                                    final collapsed = _collapseVersions(
+                                      _messages,
+                                    );
+                                    final selected = <ChatMessage>[];
+                                    for (final m in collapsed) {
+                                      if (_selectedItems.contains(m.id))
+                                        selected.add(m);
+                                    }
+                                    if (selected.isEmpty) {
+                                      final l10n = AppLocalizations.of(
+                                        context,
+                                      )!;
+                                      showAppSnackBar(
+                                        context,
+                                        message:
+                                            l10n.homePageSelectMessagesToShare,
+                                        type: NotificationType.info,
+                                      );
+                                      return;
+                                    }
+                                    setState(() {
+                                      _selecting = false;
+                                    });
+                                    await showChatExportSheet(
+                                      context,
+                                      conversation: convo,
+                                      selectedMessages: selected,
+                                    );
+                                    if (mounted)
+                                      setState(() {
+                                        _selectedItems.clear();
+                                      });
+                                  },
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+
+                        // Scroll-to-bottom button
+                        Builder(
+                          builder: (context) {
+                            final showSetting = context
+                                .watch<SettingsProvider>()
+                                .showMessageNavButtons;
+                            if (!showSetting || _messages.isEmpty)
+                              return const SizedBox.shrink();
+                            final cs = Theme.of(context).colorScheme;
+                            final isDark =
+                                Theme.of(context).brightness == Brightness.dark;
+                            final bottomOffset = _inputBarHeight + 12;
+                            return Align(
+                              alignment: Alignment.bottomRight,
+                              child: SafeArea(
+                                top: false,
+                                bottom: false,
+                                child: IgnorePointer(
+                                  ignoring: !_showJumpToBottom,
+                                  child: AnimatedScale(
+                                    scale: _showJumpToBottom ? 1.0 : 0.9,
+                                    duration: const Duration(milliseconds: 220),
+                                    curve: Curves.easeOutCubic,
+                                    child: AnimatedOpacity(
+                                      duration: const Duration(
+                                        milliseconds: 220,
+                                      ),
+                                      curve: Curves.easeOutCubic,
+                                      opacity: _showJumpToBottom ? 1 : 0,
+                                      child: Padding(
+                                        padding: EdgeInsets.only(
+                                          right: 16,
+                                          bottom: bottomOffset,
+                                        ),
+                                        child: ClipOval(
+                                          child: BackdropFilter(
+                                            filter: ui.ImageFilter.blur(
+                                              sigmaX: 14,
+                                              sigmaY: 14,
+                                            ),
+                                            child: Container(
+                                              decoration: BoxDecoration(
+                                                color: isDark
+                                                    ? Colors.white.withOpacity(
+                                                        0.06,
+                                                      )
+                                                    : Colors.white.withOpacity(
+                                                        0.07,
+                                                      ),
+                                                shape: BoxShape.circle,
+                                                border: Border.all(
+                                                  color: isDark
+                                                      ? Colors.white
+                                                            .withOpacity(0.10)
+                                                      : Theme.of(context)
+                                                            .colorScheme
+                                                            .outline
+                                                            .withOpacity(0.20),
+                                                  width: 1,
+                                                ),
+                                              ),
+                                              child: Material(
+                                                type: MaterialType.transparency,
+                                                shape: const CircleBorder(),
+                                                child: InkWell(
+                                                  customBorder:
+                                                      const CircleBorder(),
+                                                  onTap: _forceScrollToBottom,
+                                                  child: Padding(
+                                                    padding:
+                                                        const EdgeInsets.all(8),
+                                                    child: Icon(
+                                                      Lucide.ChevronDown,
+                                                      size: 18,
+                                                      color: isDark
+                                                          ? Colors.white
+                                                          : Colors.black87,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+
+                        // Scroll-to-previous-question button
+                        Builder(
+                          builder: (context) {
+                            final showSetting = context
+                                .watch<SettingsProvider>()
+                                .showMessageNavButtons;
+                            if (!showSetting || _messages.isEmpty)
+                              return const SizedBox.shrink();
+                            final isDark =
+                                Theme.of(context).brightness == Brightness.dark;
+                            final bottomOffset = _inputBarHeight + 12 + 52;
+                            final showUp = _showJumpToBottom;
+                            return Align(
+                              alignment: Alignment.bottomRight,
+                              child: SafeArea(
+                                top: false,
+                                bottom: false,
+                                child: IgnorePointer(
+                                  ignoring: !showUp,
+                                  child: AnimatedScale(
+                                    scale: showUp ? 1.0 : 0.9,
+                                    duration: const Duration(milliseconds: 220),
+                                    curve: Curves.easeOutCubic,
+                                    child: AnimatedOpacity(
+                                      duration: const Duration(
+                                        milliseconds: 220,
+                                      ),
+                                      curve: Curves.easeOutCubic,
+                                      opacity: showUp ? 1 : 0,
+                                      child: Padding(
+                                        padding: EdgeInsets.only(
+                                          right: 16,
+                                          bottom: bottomOffset,
+                                        ),
+                                        child: ClipOval(
+                                          child: BackdropFilter(
+                                            filter: ui.ImageFilter.blur(
+                                              sigmaX: 14,
+                                              sigmaY: 14,
+                                            ),
+                                            child: Container(
+                                              decoration: BoxDecoration(
+                                                color: isDark
+                                                    ? Colors.white.withOpacity(
+                                                        0.06,
+                                                      )
+                                                    : Colors.white.withOpacity(
+                                                        0.07,
+                                                      ),
+                                                shape: BoxShape.circle,
+                                                border: Border.all(
+                                                  color: isDark
+                                                      ? Colors.white
+                                                            .withOpacity(0.10)
+                                                      : Theme.of(context)
+                                                            .colorScheme
+                                                            .outline
+                                                            .withOpacity(0.20),
+                                                  width: 1,
+                                                ),
+                                              ),
+                                              child: Material(
+                                                type: MaterialType.transparency,
+                                                shape: const CircleBorder(),
+                                                child: InkWell(
+                                                  customBorder:
+                                                      const CircleBorder(),
+                                                  onTap:
+                                                      _jumpToPreviousQuestion,
+                                                  child: Padding(
+                                                    padding:
+                                                        const EdgeInsets.all(8),
+                                                    child: Icon(
+                                                      Lucide.ChevronUp,
+                                                      size: 18,
+                                                      color: isDark
+                                                          ? Colors.white
+                                                          : Colors.black87,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
       ],
-    ),
-    ),
-  ],
-);
+    );
   }
 
   @override
@@ -5563,7 +7890,35 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!_supportsBackgroundExecution) return;
+    if (state == AppLifecycleState.resumed) {
+      if (_loadingConversationIds.isEmpty) {
+        unawaited(_disableBackgroundExecution());
+      }
+      return;
+    }
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      if (_loadingConversationIds.isNotEmpty) {
+        unawaited(_ensureBackgroundExecution());
+      }
+      return;
+    }
+    if (state == AppLifecycleState.detached) {
+      unawaited(_disableBackgroundExecution());
+      return;
+    }
+    // Handle other states such as hidden on newer Flutter versions
+    if (_loadingConversationIds.isNotEmpty) {
+      unawaited(_ensureBackgroundExecution());
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(_disableBackgroundExecution());
     _convoFadeController.dispose();
     _mcpProvider?.removeListener(_onMcpChanged);
     // Remove drawer value listener
@@ -5573,7 +7928,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     _scrollController.removeListener(_onScrollControllerChanged);
     _scrollController.dispose();
     try {
-      for (final s in _conversationStreams.values) { s.cancel(); }
+      for (final s in _conversationStreams.values) {
+        s.cancel();
+      }
     } catch (_) {}
     _conversationStreams.clear();
     _userScrollTimer?.cancel();
@@ -5600,11 +7957,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     // Returning to this page: ensure keyboard stays closed unless user taps.
     WidgetsBinding.instance.addPostFrameCallback((_) => _dismissKeyboard());
   }
-
 }
 
 class _SidebarResizeHandle extends StatefulWidget {
-  const _SidebarResizeHandle({required this.visible, required this.onDrag, this.onDragEnd});
+  const _SidebarResizeHandle({
+    required this.visible,
+    required this.onDrag,
+    this.onDragEnd,
+  });
   final bool visible;
   final ValueChanged<double> onDrag;
   final VoidCallback? onDragEnd;
@@ -5635,7 +7995,9 @@ class _SidebarResizeHandleState extends State<_SidebarResizeHandle> {
           child: Container(
             width: 1,
             height: double.infinity,
-            color: (_hovered ? cs.primary.withOpacity(0.28) : cs.outlineVariant.withOpacity(0.10)),
+            color: (_hovered
+                ? cs.primary.withOpacity(0.28)
+                : cs.outlineVariant.withOpacity(0.10)),
           ),
         ),
       ),
@@ -5676,7 +8038,6 @@ class _CurrentModelIcon extends StatelessWidget {
   final bool withBackground; // whether to draw circular background
   final Color? backgroundColor; // override background color if provided
 
-
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
@@ -5688,7 +8049,8 @@ class _CurrentModelIcon extends StatelessWidget {
     if (asset != null) {
       if (asset.endsWith('.svg')) {
         final isColorful = asset.contains('color');
-        final ColorFilter? tint = (Theme.of(context).brightness == Brightness.dark && !isColorful)
+        final ColorFilter? tint =
+            (Theme.of(context).brightness == Brightness.dark && !isColorful)
             ? const ColorFilter.mode(Colors.white, BlendMode.srcIn)
             : null;
         inner = SvgPicture.asset(
@@ -5698,12 +8060,21 @@ class _CurrentModelIcon extends StatelessWidget {
           colorFilter: tint,
         );
       } else {
-        inner = Image.asset(asset, width: size * 0.5, height: size * 0.5, fit: BoxFit.contain);
+        inner = Image.asset(
+          asset,
+          width: size * 0.5,
+          height: size * 0.5,
+          fit: BoxFit.contain,
+        );
       }
     } else {
       inner = Text(
         modelId!.isNotEmpty ? modelId!.characters.first.toUpperCase() : '?',
-        style: TextStyle(color: cs.primary, fontWeight: FontWeight.w700, fontSize: size * 0.43),
+        style: TextStyle(
+          color: cs.primary,
+          fontWeight: FontWeight.w700,
+          fontSize: size * 0.43,
+        ),
       );
     }
     return Container(
@@ -5711,7 +8082,8 @@ class _CurrentModelIcon extends StatelessWidget {
       height: size,
       decoration: BoxDecoration(
         color: withBackground
-            ? (backgroundColor ?? (isDark ? Colors.white10 : cs.primary.withOpacity(0.1)))
+            ? (backgroundColor ??
+                  (isDark ? Colors.white10 : cs.primary.withOpacity(0.1)))
             : Colors.transparent,
         shape: BoxShape.circle,
       ),
@@ -5719,7 +8091,11 @@ class _CurrentModelIcon extends StatelessWidget {
       child: SizedBox(
         width: size * 0.64,
         height: size * 0.64,
-        child: Center(child: inner is SvgPicture || inner is Image ? inner : FittedBox(child: inner)),
+        child: Center(
+          child: inner is SvgPicture || inner is Image
+              ? inner
+              : FittedBox(child: inner),
+        ),
       ),
     );
   }
@@ -5801,9 +8177,15 @@ class _GlassCapsuleButtonState extends State<_GlassCapsuleButton> {
     final cs = theme.colorScheme;
     final isDark = theme.brightness == Brightness.dark;
     // Glass background, match providers' capsule taste
-    final glassBase = isDark ? Colors.black.withOpacity(0.06) : Colors.white.withOpacity(0.65);
-    final overlay = isDark ? Colors.black.withOpacity(0.06) : Colors.black.withOpacity(0.05);
-    final tileColor = _pressed ? Color.alphaBlend(overlay, glassBase) : glassBase;
+    final glassBase = isDark
+        ? Colors.black.withOpacity(0.06)
+        : Colors.white.withOpacity(0.65);
+    final overlay = isDark
+        ? Colors.black.withOpacity(0.06)
+        : Colors.black.withOpacity(0.05);
+    final tileColor = _pressed
+        ? Color.alphaBlend(overlay, glassBase)
+        : glassBase;
     final borderColor = cs.outlineVariant.withOpacity(isDark ? 0.35 : 0.40);
 
     return GestureDetector(
@@ -5838,7 +8220,11 @@ class _GlassCapsuleButtonState extends State<_GlassCapsuleButton> {
                   const SizedBox(width: 6),
                   Text(
                     widget.label,
-                    style: TextStyle(color: widget.color, fontSize: 14, fontWeight: FontWeight.w600),
+                    style: TextStyle(
+                      color: widget.color,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ],
               ),
@@ -5866,7 +8252,8 @@ class _GlassCircleButtonSmall extends StatefulWidget {
   final double size; // diameter
 
   @override
-  State<_GlassCircleButtonSmall> createState() => _GlassCircleButtonSmallState();
+  State<_GlassCircleButtonSmall> createState() =>
+      _GlassCircleButtonSmallState();
 }
 
 class _GlassCircleButtonSmallState extends State<_GlassCircleButtonSmall> {
@@ -5876,9 +8263,15 @@ class _GlassCircleButtonSmallState extends State<_GlassCircleButtonSmall> {
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
     final isDark = theme.brightness == Brightness.dark;
-    final glassBase = isDark ? Colors.black.withOpacity(0.06) : Colors.white.withOpacity(0.06);
-    final overlay = isDark ? Colors.white.withOpacity(0.06) : Colors.black.withOpacity(0.05);
-    final tileColor = _pressed ? Color.alphaBlend(overlay, glassBase) : glassBase;
+    final glassBase = isDark
+        ? Colors.black.withOpacity(0.06)
+        : Colors.white.withOpacity(0.06);
+    final overlay = isDark
+        ? Colors.white.withOpacity(0.06)
+        : Colors.black.withOpacity(0.05);
+    final tileColor = _pressed
+        ? Color.alphaBlend(overlay, glassBase)
+        : glassBase;
     final borderColor = cs.outlineVariant.withOpacity(isDark ? 0.10 : 0.10);
 
     final child = SizedBox(
