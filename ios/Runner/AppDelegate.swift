@@ -3,14 +3,17 @@ import UIKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate {
+  private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
+  private var backgroundChannel: FlutterMethodChannel?
+  
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
     GeneratedPluginRegistrant.register(with: self)
     if let controller = window?.rootViewController as? FlutterViewController {
-      let channel = FlutterMethodChannel(name: "app.clipboard", binaryMessenger: controller.binaryMessenger)
-      channel.setMethodCallHandler { (call: FlutterMethodCall, result: @escaping FlutterResult) in
+      let clipboardChannel = FlutterMethodChannel(name: "app.clipboard", binaryMessenger: controller.binaryMessenger)
+      clipboardChannel.setMethodCallHandler { (call: FlutterMethodCall, result: @escaping FlutterResult) in
         if call.method == "getClipboardImages" {
           var paths: [String] = []
           if let image = UIPasteboard.general.image {
@@ -31,7 +34,47 @@ import UIKit
           result(FlutterMethodNotImplemented)
         }
       }
+      
+      backgroundChannel = FlutterMethodChannel(name: "app.background", binaryMessenger: controller.binaryMessenger)
+      backgroundChannel?.setMethodCallHandler { [weak self] (call: FlutterMethodCall, result: @escaping FlutterResult) in
+        guard let self = self else {
+          result(FlutterError(code: "UNAVAILABLE", message: "AppDelegate unavailable", details: nil))
+          return
+        }
+        
+        switch call.method {
+        case "initialize":
+          result(true)
+        case "hasPermissions":
+          result(true)
+        case "enableBackgroundExecution":
+          self.beginBackgroundTask()
+          result(self.backgroundTaskId != .invalid)
+        case "disableBackgroundExecution":
+          self.endBackgroundTask()
+          result(nil)
+        case "isBackgroundExecutionEnabled":
+          result(self.backgroundTaskId != .invalid)
+        default:
+          result(FlutterMethodNotImplemented)
+        }
+      }
     }
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+  
+  private func beginBackgroundTask() {
+    guard backgroundTaskId == .invalid else { return }
+    
+    backgroundTaskId = UIApplication.shared.beginBackgroundTask { [weak self] in
+      self?.endBackgroundTask()
+    }
+  }
+  
+  private func endBackgroundTask() {
+    guard backgroundTaskId != .invalid else { return }
+    
+    UIApplication.shared.endBackgroundTask(backgroundTaskId)
+    backgroundTaskId = .invalid
   }
 }

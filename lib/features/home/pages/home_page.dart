@@ -75,7 +75,7 @@ import '../../quick_phrase/pages/quick_phrases_page.dart';
 import '../../../shared/widgets/ios_checkbox.dart';
 import '../../../desktop/quick_phrase_popover.dart';
 import '../../../utils/app_directories.dart';
-import 'package:flutter_background/flutter_background.dart';
+import '../../../core/services/background_execution_service.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -172,72 +172,14 @@ class _HomePageState extends State<HomePage>
     }
   }
 
-  bool get _supportsBackgroundExecution => _isAndroidOrHarmony;
-
-  bool _backgroundInitialized = false;
-  bool _backgroundExecutionEnabled = false;
-  bool _backgroundUnavailable = false;
-
-  FlutterBackgroundAndroidConfig get _androidBackgroundConfig =>
-      const FlutterBackgroundAndroidConfig(
-        notificationTitle: 'Kelivo',
-        notificationText: 'Generating reply in background…',
-        notificationImportance: AndroidNotificationImportance.normal,
-        enableWifiLock: true,
-      );
-
-  Future<bool> _ensureBackgroundInitialized() async {
-    if (!_supportsBackgroundExecution || _backgroundUnavailable) return false;
-    if (_backgroundInitialized) return !_backgroundUnavailable;
-    try {
-      final success = await FlutterBackground.initialize(
-        androidConfig: _androidBackgroundConfig,
-      );
-      _backgroundInitialized = true;
-      if (!success) {
-        _backgroundUnavailable = true;
-      }
-      return success;
-    } catch (_) {
-      _backgroundInitialized = true;
-      _backgroundUnavailable = true;
-      return false;
-    }
-  }
-
-  Future<void> _ensureBackgroundExecution() async {
-    if (!_supportsBackgroundExecution ||
-        _backgroundExecutionEnabled ||
-        _backgroundUnavailable)
-      return;
-    final ready = await _ensureBackgroundInitialized();
-    if (!ready) return;
-    try {
-      final enabled = await FlutterBackground.enableBackgroundExecution();
-      _backgroundExecutionEnabled = enabled == true;
-      if (!_backgroundExecutionEnabled) {
-        _backgroundUnavailable = true;
-      }
-    } catch (_) {
-      _backgroundUnavailable = true;
-      _backgroundExecutionEnabled = false;
-    }
-  }
-
-  Future<void> _disableBackgroundExecution() async {
-    if (!_supportsBackgroundExecution || !_backgroundExecutionEnabled) return;
-    try {
-      await FlutterBackground.disableBackgroundExecution();
-    } catch (_) {}
-    _backgroundExecutionEnabled = false;
-  }
+  final BackgroundExecutionService _backgroundService = BackgroundExecutionService();
 
   void _updateBackgroundExecutionState(bool loading) {
-    if (!_supportsBackgroundExecution) return;
+    if (!_backgroundService.isSupported) return;
     if (loading) {
-      unawaited(_ensureBackgroundExecution());
+      unawaited(_backgroundService.enable());
     } else if (_loadingConversationIds.isEmpty) {
-      unawaited(_disableBackgroundExecution());
+      unawaited(_backgroundService.disable());
     }
   }
 
@@ -7920,34 +7862,34 @@ class _HomePageState extends State<HomePage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (!_supportsBackgroundExecution) return;
+    if (!_backgroundService.isSupported) return;
     if (state == AppLifecycleState.resumed) {
       if (_loadingConversationIds.isEmpty) {
-        unawaited(_disableBackgroundExecution());
+        unawaited(_backgroundService.disable());
       }
       return;
     }
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive) {
       if (_loadingConversationIds.isNotEmpty) {
-        unawaited(_ensureBackgroundExecution());
+        unawaited(_backgroundService.enable());
       }
       return;
     }
     if (state == AppLifecycleState.detached) {
-      unawaited(_disableBackgroundExecution());
+      unawaited(_backgroundService.disable());
       return;
     }
     // Handle other states such as hidden on newer Flutter versions
     if (_loadingConversationIds.isNotEmpty) {
-      unawaited(_ensureBackgroundExecution());
+      unawaited(_backgroundService.enable());
     }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    unawaited(_disableBackgroundExecution());
+    unawaited(_backgroundService.disable());
     _convoFadeController.dispose();
     _mcpProvider?.removeListener(_onMcpChanged);
     // Remove drawer value listener
